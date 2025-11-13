@@ -111,31 +111,73 @@ export default function MyBoardinghouse() {
           minHeight: "100vh",
         }}
       >
-        <div className="page-header">
+        <div className="page-header" style={{ display: "flex", alignItems: "center" }}>
           <Link to="/dashboard" className="back-button">
             <ArrowLeft />
           </Link>
           <h1>My Boardinghouse</h1>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <Link to="/add-boardinghouse" className="add-button">
-              <Plus /> Add
-            </Link>
-            <button
-              className="add-button"
-              onClick={handleDeleteAll}
-              title="Delete all boardinghouses (testing)"
-              style={{ display: "flex", alignItems: "center", gap: 6 }}
-            >
-              <Trash /> Delete All
-            </button>
-          </div>
+
+          {/* show compact Add + Delete All only when there are boardinghouses;
+              buttons aligned to the right using marginLeft: 'auto' */}
+          {boardinghouses.length > 0 && (
+            <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+              <Link
+                to="/add-boardinghouse"
+                className="btn-add-small"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "8px 14px",
+                  borderRadius: 20,
+                  textDecoration: "none",
+                  color: "white",
+                  background: "linear-gradient(90deg,#0ea5e9,#06b6d4)", // cyan/blue for Add
+                  boxShadow: "0 8px 20px rgba(6,182,212,0.12)",
+                }}
+              >
+                <Plus /> <span>Add</span>
+              </Link>
+
+              <button
+                className="btn-delete-all"
+                onClick={handleDeleteAll}
+                title="Delete all boardinghouses (testing)"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "8px 14px",
+                  borderRadius: 20,
+                  border: "none",
+                  cursor: "pointer",
+                  color: "white",
+                  background: "linear-gradient(90deg,#ef4444,#dc2626)", // red gradient
+                  boxShadow: "0 8px 24px rgba(220,38,38,0.18)",
+                }}
+              >
+                <Trash /> <span>Delete All</span>
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="boardinghouse-list">
           {boardinghouses.length === 0 ? (
-            <div className="empty-state">
-              <p>No boardinghouses yet. Add one to get started.</p>
-              <Link to="/add-boardinghouse" className="add-button">
+            <div
+              className="empty-state"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 12,
+                padding: 40,
+                textAlign: "center",
+              }}
+            >
+              <p style={{ margin: 0 }}>No boardinghouses yet. Add one to get started.</p>
+              <Link to="/add-boardinghouse" className="add-button" style={{ marginTop: 8 }}>
                 <Plus /> Add Boardinghouse
               </Link>
             </div>
