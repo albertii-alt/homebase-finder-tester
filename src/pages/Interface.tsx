@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, useRef } from "react";
-import { Menu, Home, Info, LayoutDashboard, HelpCircle, Shield, Settings, LogOut } from "lucide-react";
+import { Menu, Home, Info, LayoutDashboard, HelpCircle, Shield, Settings, LogOut, Heart } from "lucide-react";
 import {
   Sheet,
   SheetContent,
@@ -12,10 +12,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import '../styles/interface.css';
 import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router-dom";
-import LogoutModal from "@/components/LogoutModal"; // new import
+import LogoutModal from "@/components/LogoutModal";
+import regionsJson from "../ph-json/region.json";
 
 interface CurrentUser {
   name?: string;
@@ -50,6 +52,86 @@ type Boardinghouse = {
   rooms?: Room[];
 };
 
+type Region = {
+  id: number;
+  psgc_code: string;
+  region_name: string;
+  region_code: string;
+};
+
+type PriceFilterValue = "below-500" | "500-1000" | "1000-above";
+type GenderFilterValue = "male" | "female" | "any";
+
+const REGIONS: Region[] = regionsJson as Region[];
+const REGION_ALL = "all";
+const PRICE_ALL = "all";
+const GENDER_ALL = "all";
+
+const priceLabelMap: Record<PriceFilterValue, string> = {
+  "below-500": "Below ₱500",
+  "500-1000": "₱500 – ₱1,000",
+  "1000-above": "₱1,000 and above",
+};
+
+const genderLabelMap: Record<GenderFilterValue, string> = {
+  male: "Male",
+  female: "Female",
+  any: "Any",
+};
+
+const regionMatchesBoardinghouse = (bh: Boardinghouse, regionCode: string): boolean => {
+  const region = REGIONS.find((r) => r.region_code === regionCode);
+  if (!region) return false;
+
+  const address = (bh.address ?? "").toLowerCase();
+  const regionName = region.region_name.toLowerCase();
+  if (address.includes(regionName)) return true;
+
+  const candidates = [
+    (bh as any).regionCode,
+    (bh as any).region_code,
+    (bh as any).region,
+    (bh as any).regionName,
+    (bh as any).region_name,
+  ]
+    .filter(Boolean)
+    .map((value) => String(value).toLowerCase());
+
+  return candidates.some((value) => value === regionCode || regionName.includes(value) || value.includes(regionName));
+};
+
+const priceMatchesBoardinghouse = (bh: Boardinghouse, range: PriceFilterValue): boolean => {
+  if (!bh.rooms || bh.rooms.length === 0) return false;
+  return bh.rooms.some((room) => {
+    const price = Number(room.rentPrice ?? 0);
+    if (!Number.isFinite(price)) return false;
+    switch (range) {
+      case "below-500":
+        return price > 0 && price < 500;
+      case "500-1000":
+        return price >= 500 && price <= 1000;
+      case "1000-above":
+        return price >= 1000;
+      default:
+        return false;
+    }
+  });
+};
+
+const genderMatchesBoardinghouse = (bh: Boardinghouse, gender: GenderFilterValue): boolean => {
+  if (!bh.rooms || bh.rooms.length === 0) {
+    return gender === "any";
+  }
+  return bh.rooms.some((room) => {
+    const value = String(room.gender ?? "").toLowerCase();
+    if (!value) return gender === "any";
+    if (gender === "any") {
+      return ["any", "either", "mixed", "coed", "co-ed", "unisex"].some((token) => value.includes(token));
+    }
+    return value === gender;
+  });
+};
+
 const Interface = () => {
   const navigate = useNavigate();
   const [isOpen, setIsOpen] = useState(false);
@@ -76,6 +158,7 @@ const Interface = () => {
   const menuItems = [
     { icon: Home, label: "Home", onClick: () => navigate("/interface") },
     { icon: Info, label: "About", onClick: () => navigate("/about") },
+    { icon: Heart, label: "Favorites", onClick: () => navigate("/favorites") },
     // Dashboard only visible for owners
     ...(user.role === "owner" ? [{ icon: LayoutDashboard, label: "Dashboard", onClick: () => navigate("/dashboard") }] : []),
     { icon: HelpCircle, label: "Help", onClick: () => {} },
@@ -87,10 +170,17 @@ const Interface = () => {
   // local state for boardinghouses loaded from localStorage
   const [boardinghouses, setBoardinghouses] = useState<Boardinghouse[]>([]);
 
-  // filters / search
-  const [searchQuery, setSearchQuery] = useState("");
-  const [locationFilter, setLocationFilter] = useState<string | null>(null);
-  const [availableFilter, setAvailableFilter] = useState<"all" | "hasAvailable" | "noAvailable">("all");
+  // filters / search (input values)
+  const [searchInput, setSearchInput] = useState("");
+  const [regionInput, setRegionInput] = useState<string | null>(null);
+  const [priceInput, setPriceInput] = useState<PriceFilterValue | null>(null);
+  const [genderInput, setGenderInput] = useState<GenderFilterValue | null>(null);
+
+  // applied filters (only change when Search is clicked)
+  const [appliedSearch, setAppliedSearch] = useState("");
+  const [appliedRegion, setAppliedRegion] = useState<string | null>(null);
+  const [appliedPrice, setAppliedPrice] = useState<PriceFilterValue | null>(null);
+  const [appliedGender, setAppliedGender] = useState<GenderFilterValue | null>(null);
 
   // keep last serialized value to detect same-tab changes (storage event won't fire in same tab)
   const lastDataRef = useRef<string>("");
@@ -146,31 +236,41 @@ const Interface = () => {
   }, []);
 
   // derive unique location options from loaded boardinghouses
-  const locationOptions = useMemo(() => {
-    const setLoc = new Set<string>();
-    for (const bh of boardinghouses) {
-      if (bh.address) {
-        // try to extract a concise location (take part after comma if present)
-        const parts = bh.address.split(",").map((p) => p.trim()).filter(Boolean);
-        if (parts.length > 1) {
-          setLoc.add(parts[parts.length - 1]);
-        } else {
-          setLoc.add(bh.address);
-        }
-      }
-    }
-    return Array.from(setLoc).sort();
-  }, [boardinghouses]);
+  const selectedRegion = useMemo(
+    () => (appliedRegion ? REGIONS.find((region) => region.region_code === appliedRegion) : undefined),
+    [appliedRegion]
+  );
 
-  // helper: does boardinghouse have any available beds?
-  const hasAvailableRooms = (bh: Boardinghouse) => {
-    if (!bh.rooms || bh.rooms.length === 0) return false;
-    return bh.rooms.some((r) => Number(r.availableBeds) > 0);
+  const filterChips = useMemo(() => {
+     const chips: { label: string; value: string }[] = [];
+    if (appliedSearch.trim()) chips.push({ label: "Search", value: `"${appliedSearch.trim()}"` });
+    if (selectedRegion) chips.push({ label: "Region", value: selectedRegion.region_name });
+    if (appliedPrice) chips.push({ label: "Price", value: priceLabelMap[appliedPrice] });
+    if (appliedGender) chips.push({ label: "Gender", value: genderLabelMap[appliedGender] });
+    return chips;
+  }, [appliedSearch, selectedRegion, appliedPrice, appliedGender]);
+
+  const handleClearFilters = () => {
+    setSearchInput("");
+    setRegionInput(null);
+    setPriceInput(null);
+    setGenderInput(null);
+    setAppliedSearch("");
+    setAppliedRegion(null);
+    setAppliedPrice(null);
+    setAppliedGender(null);
+  };
+
+  const handleApplyFilters = () => {
+    setAppliedSearch(searchInput);
+    setAppliedRegion(regionInput);
+    setAppliedPrice(priceInput);
+    setAppliedGender(genderInput);
   };
 
   // apply search + filters
   const filtered = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
+    const q = appliedSearch.trim().toLowerCase();
     return boardinghouses.filter((bh) => {
       // search by name or address
       if (q) {
@@ -178,19 +278,44 @@ const Interface = () => {
         const inAddress = bh.address?.toLowerCase().includes(q);
         if (!inName && !inAddress) return false;
       }
-      // location filter
-      if (locationFilter) {
-        const parts = (bh.address ?? "").split(",").map((p) => p.trim());
-        const lastPart = parts.length > 0 ? parts[parts.length - 1] : "";
-        if (!lastPart.toLowerCase().includes(locationFilter.toLowerCase())) return false;
+      if (appliedRegion && !regionMatchesBoardinghouse(bh, appliedRegion)) {
+        return false;
       }
-      // available filter
-      if (availableFilter === "hasAvailable" && !hasAvailableRooms(bh)) return false;
-      if (availableFilter === "noAvailable" && hasAvailableRooms(bh)) return false;
+      if (appliedPrice && !priceMatchesBoardinghouse(bh, appliedPrice)) {
+        return false;
+      }
+      if (appliedGender && !genderMatchesBoardinghouse(bh, appliedGender)) {
+        return false;
+      }
 
       return true;
     });
-  }, [boardinghouses, searchQuery, locationFilter, availableFilter]);
+  }, [boardinghouses, appliedSearch, appliedRegion, appliedPrice, appliedGender]);
+
+  const hasAvailableRooms = (bh: Boardinghouse) => {
+    if (!bh.rooms || bh.rooms.length === 0) return false;
+    return bh.rooms.some((r) => Number(r.availableBeds) > 0);
+  };
+
+  const [favoriteIds, setFavoriteIds] = useState<string[]>(() => {
+    try {
+      const stored = localStorage.getItem("favoriteBoardinghouses");
+      const parsedFav = stored ? JSON.parse(stored) : [];
+      return Array.isArray(parsedFav) ? parsedFav : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const toggleFavorite = (boardinghouseId: string) => {
+    setFavoriteIds((prev) => {
+      const next = prev.includes(boardinghouseId)
+        ? prev.filter((id) => id !== boardinghouseId)
+        : [...prev, boardinghouseId];
+      localStorage.setItem("favoriteBoardinghouses", JSON.stringify(next));
+      return next;
+    });
+  };
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100">
@@ -257,7 +382,7 @@ const Interface = () => {
                   </div>
 
                   {/* Menu Items */}
-                  <nav className="flex-1 py-6">
+                  <nav className="sidebar-menu flex-1 py-6 overflow-y-auto">
                     {menuItems.map((item, index) => (
                       <button
                         key={index}
@@ -293,92 +418,193 @@ const Interface = () => {
       <main className="container mx-auto px-4 py-8">
         {/* Filters Section */}
         <div className="bg-white rounded-lg shadow-md p-6 mb-8">
-          <h2 className="text-2xl font-bold mb-6 text-foreground">Filters</h2>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-            <Select>
-              <SelectTrigger className="bg-slate-50">
-                <SelectValue placeholder="Location" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="trinidad">Trinidad, Bohol</SelectItem>
-                <SelectItem value="tagbilaran">Tagbilaran City</SelectItem>
-                <SelectItem value="ubay">Ubay</SelectItem>
-              </SelectContent>
-            </Select>
+          <div className="filters-header">
+            <h2 className="filters-title text-foreground">Filters</h2>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleClearFilters}
+              className="filter-action-btn"
+            >
+               Reset Filters
+             </Button>
+          </div>
 
-            <Select>
-              <SelectTrigger className="bg-slate-50">
-                <SelectValue placeholder="Price Range" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="low">₱500 - ₱1,000</SelectItem>
-                <SelectItem value="mid">₱1,000 - ₱2,000</SelectItem>
-                <SelectItem value="high">₱2,000+</SelectItem>
-              </SelectContent>
-            </Select>
+          <div className="filters-grid">
+            <div className="filter-item md:col-span-2">
+               <label className="filter-label" htmlFor="filter-search">Search</label>
+               <Input
+                 id="filter-search"
+                 value={searchInput}
+                 onChange={(event) => setSearchInput(event.target.value)}
+                 placeholder="Search by name or address"
+                 className="bg-slate-50"
+               />
+             </div>
 
-            <Select>
-              <SelectTrigger className="bg-slate-50">
-                <SelectValue placeholder="Gender" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="male">Male</SelectItem>
-                <SelectItem value="female">Female</SelectItem>
-                <SelectItem value="any">Any</SelectItem>
-              </SelectContent>
-            </Select>
+            <div className="filter-item">
+              <label className="filter-label">Region</label>
+              <Select
+                value={regionInput ?? REGION_ALL}
+                onValueChange={(value) => setRegionInput(value === REGION_ALL ? null : value)}
+              >
+                <SelectTrigger className="bg-slate-50">
+                  <SelectValue placeholder="Region" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={REGION_ALL}>All Regions</SelectItem>
+                  {REGIONS.map((region) => (
+                    <SelectItem key={region.region_code} value={region.region_code}>
+                      {region.region_name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
 
-            <Button className="bg-gradient-to-r from-blue-900 to-cyan-600 hover:from-blue-800 hover:to-cyan-500 text-white font-semibold">
-              Search
-            </Button>
+            <div className="filter-item">
+              <label className="filter-label">Price Range</label>
+              <Select
+                value={priceInput ?? PRICE_ALL}
+                onValueChange={(value) =>
+                  setPriceInput(value === PRICE_ALL ? null : (value as PriceFilterValue))
+                }
+              >
+                <SelectTrigger className="bg-slate-50">
+                  <SelectValue placeholder="Price Range" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={PRICE_ALL}>All Prices</SelectItem>
+                  <SelectItem value="below-500">Below ₱500</SelectItem>
+                  <SelectItem value="500-1000">₱500 – ₱1,000</SelectItem>
+                  <SelectItem value="1000-above">₱1,000 and above</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="filter-item">
+              <label className="filter-label">Gender</label>
+              <Select
+                value={genderInput ?? GENDER_ALL}
+                onValueChange={(value) =>
+                  setGenderInput(value === GENDER_ALL ? null : (value as GenderFilterValue))
+                }
+              >
+                <SelectTrigger className="bg-slate-50">
+                  <SelectValue placeholder="Gender" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={GENDER_ALL}>Any Gender</SelectItem>
+                  <SelectItem value="male">Male</SelectItem>
+                  <SelectItem value="female">Female</SelectItem>
+                  <SelectItem value="any">Any / Mixed</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="filter-item">
+              <label className="filter-label" aria-hidden="true">&nbsp;</label>
+              <Button
+                type="button"
+                onClick={handleApplyFilters}
+                className="filter-action-btn w-full"
+              >
+                Search
+              </Button>
+             </div>
+          </div>
+
+          <div className="filters-active-summary">
+            <span className="font-semibold">{filtered.length}</span>
+            <span>{filtered.length === 1 ? "result" : "results"}</span>
+            {filterChips.length === 0 ? (
+               <span className="text-slate-500">showing all boardinghouses</span>
+             ) : (
+               filterChips.map((chip) => (
+                 <span key={`${chip.label}-${chip.value}`} className="filter-chip">
+                   {chip.label}: {chip.value}
+                 </span>
+               ))
+             )}
           </div>
         </div>
 
         {/* Properties Section */}
         <div className="mb-6">
           <h2 className="text-3xl font-bold text-foreground mb-6">All Boardinghouses</h2>
-          <div className="space-y-6">
-            {filtered.map((property) => (
-              <div
-                key={property.id}
-                className="bg-white rounded-2xl shadow-lg overflow-hidden hover:shadow-xl transition-shadow"
-              >
-                <div className="grid md:grid-cols-2 gap-0">
-                  <div className="aspect-video md:aspect-auto">
-                    <img
-                      src={property.photos?.[0] ?? "/placeholder.svg"}
-                      alt={property.name}
-                      className="w-full h-full object-cover"
-                    />
-                  </div>
-                  <div className="bg-gradient-to-br from-cyan-400 to-blue-500 p-8 text-white flex flex-col justify-center">
-                    <h3 className="text-3xl font-bold mb-4">
-                      {property.name}
-                    </h3>
-                    <p className="text-white/90 mb-4 line-clamp-4">
-                      {property.description}
-                    </p>
-                    <div className="flex items-center gap-2 mb-2">
-                      <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                        <path fillRule="evenodd" d="M5.05 4.05a7 7 0 119.9 9.9L10 18.9l-4.95-4.95a7 7 0 010-9.9zM10 11a2 2 0 100-4 2 2 0 000 4z" clipRule="evenodd" />
-                      </svg>
-                      <span className="text-sm">{property.address}</span>
-                    </div>
-                    <div className="text-2xl font-bold mb-4">
-                      ₱{property.rooms?.[0]?.rentPrice.toLocaleString()} / month
-                    </div>
-                    <Button
-                      variant="outline"
-                      className="bg-white/10 border-white/50 text-white hover:bg-white/20 hover:text-white"
-                      onClick={() => navigate(`/boardinghouse/${property.id}`)}
+          {filtered.length === 0 ? (
+            <div className="bg-white rounded-2xl shadow-inner border border-dashed border-slate-300 p-10 text-center text-slate-600">
+              No boardinghouses match your current filters.
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {filtered.map((property) => {
+                const firstPricedRoom = property.rooms?.find(
+                  (room) => typeof room.rentPrice === "number"
+                );
+                const formattedPrice =
+                  firstPricedRoom && Number.isFinite(firstPricedRoom.rentPrice)
+                    ? `₱${Number(firstPricedRoom.rentPrice).toLocaleString()} / month`
+                    : "Price not available";
+                const isFavorite = favoriteIds.includes(property.id);
+
+                return (
+                  <div
+                    key={property.id}
+                    className="bg-white rounded-2xl shadow-lg overflow-hidden hover:shadow-xl transition-shadow property-card"
+                  >
+                    <button
+                      type="button"
+                      className="favorite-toggle"
+                      aria-label={isFavorite ? "Remove from favorites" : "Add to favorites"}
+                      onClick={() => toggleFavorite(property.id)}
                     >
-                      View Details
-                    </Button>
+                      <Heart
+                        size={18}
+                        color={isFavorite ? "#f87171" : "#94a3b8"}
+                        fill={isFavorite ? "#f87171" : "transparent"}
+                      />
+                    </button>
+
+                    <div className="grid md:grid-cols-2 gap-0">
+                      <div className="aspect-video md:aspect-auto">
+                        <img
+                          src={property.photos?.[0] ?? "/placeholder.svg"}
+                          alt={property.name}
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+
+                      <div className="bg-gradient-to-br from-cyan-400 to-blue-500 p-8 text-white flex flex-col justify-center">
+                        <h3 className="text-3xl font-bold mb-4">{property.name}</h3>
+                        <p className="text-white/90 mb-4 line-clamp-4">{property.description}</p>
+
+                        <div className="flex items-center gap-2 mb-2">
+                          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                            <path
+                              fillRule="evenodd"
+                              d="M5.05 4.05a7 7 0 119.9 9.9L10 18.9l-4.95-4.95a7 7 0 010-9.9zM10 11a2 2 0 100-4 2 2 0 000 4z"
+                              clipRule="evenodd"
+                            />
+                          </svg>
+                          <span className="text-sm">{property.address}</span>
+                        </div>
+
+                        <div className="text-2xl font-bold mb-4">{formattedPrice}</div>
+
+                        <Button
+                          variant="outline"
+                          className="bg-white/10 border-white/50 text-white hover:bg-white/20 hover:text-white"
+                          onClick={() => navigate(`/boardinghouse/${property.id}`)}
+                        >
+                          View Details
+                        </Button>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </div>
-            ))}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </main>
     </div>

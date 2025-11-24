@@ -359,9 +359,85 @@ const Dashboard = () => {
     return { male, female, any: anyCount };
   }, [rooms]);
 
-   const roomsWithCRPercent = totalRooms > 0 ? Math.round((roomsWithCR / totalRooms) * 100) : 0;
-   const maxGenderCount = Math.max(1, roomsByGenderCounts.male, roomsByGenderCounts.female, roomsByGenderCounts.any);
- 
+  // ----- Data Overview helpers -----
+  const { totalBeds, occupiedBeds, occupancyPercent } = React.useMemo(() => {
+    const totals = rooms.reduce(
+      (acc, room) => {
+        const total = Number(room.totalBeds) || 0;
+        const available = Number(room.availableBeds) || 0;
+        acc.total += total;
+        acc.occupied += Math.max(0, total - available);
+        return acc;
+      },
+      { total: 0, occupied: 0 }
+    );
+    return {
+      totalBeds: totals.total,
+      occupiedBeds: totals.occupied,
+      occupancyPercent: totals.total > 0 ? Math.round((totals.occupied / totals.total) * 100) : 0,
+    };
+  }, [rooms]);
+
+  const amenityData = React.useMemo(() => {
+    const counts = {
+      wifi: 0,
+      aircon: 0,
+      fan: 0,
+      cooking: 0,
+      privateCR: 0,
+    };
+    rooms.forEach((room) => {
+      const inclusions = (room.inclusions || []).map((item) => String(item).toLowerCase());
+      if (inclusions.some((item) => item.includes("wifi"))) counts.wifi += 1;
+      if (inclusions.some((item) => item.includes("aircon") || item.includes("air-con") || item.includes("ac")))
+        counts.aircon += 1;
+      if (inclusions.some((item) => item.includes("fan"))) counts.fan += 1;
+      if (room.cookingAllowed) counts.cooking += 1;
+      if (room.withCR) counts.privateCR += 1;
+    });
+    return [
+      { name: "WiFi", count: counts.wifi },
+      { name: "Aircon", count: counts.aircon },
+      { name: "Fan", count: counts.fan },
+      { name: "Cooking Allowed", count: counts.cooking },
+      { name: "Private CR", count: counts.privateCR },
+    ];
+  }, [rooms]);
+
+  const priceRangeData = React.useMemo(() => {
+    const buckets = [
+      { label: "0–999", min: 0, max: 999, count: 0 },
+      { label: "1000–1499", min: 1000, max: 1499, count: 0 },
+      { label: "1500–1999", min: 1500, max: 1999, count: 0 },
+      { label: "2000+", min: 2000, max: Infinity, count: 0 },
+    ];
+    rooms.forEach((room) => {
+      const price = Number(room.rentPrice);
+      if (!Number.isFinite(price)) return;
+      const bucket = buckets.find((b) => price >= b.min && price <= b.max);
+      if (bucket) bucket.count += 1;
+    });
+    return buckets.map((bucket) => ({ name: bucket.label, count: bucket.count }));
+  }, [rooms]);
+
+  const performanceData = React.useMemo(() => {
+    return boardinghouses.map((bh) => {
+      const bhRooms = bh.rooms || [];
+      const total = bhRooms.length;
+      const available = bhRooms.filter((room) => Number(room.availableBeds) > 0).length;
+      return {
+        name: bh.name || "Untitled",
+        total,
+        available,
+        occupied: Math.max(0, total - available),
+      };
+    });
+  }, [boardinghouses]);
+  // ----- end helpers -----
+
+  const roomsWithCRPercent = totalRooms > 0 ? Math.round((roomsWithCR / totalRooms) * 100) : 0;
+  const maxGenderCount = Math.max(1, roomsByGenderCounts.male, roomsByGenderCounts.female, roomsByGenderCounts.any);
+
    return (
      <div className="app-layout">
       <Sidebar />
@@ -527,75 +603,231 @@ const Dashboard = () => {
           </div>
 
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
-            <div style={{ flex: "1 1 320px", padding: 12, background: "#fff", borderRadius: 8, boxShadow: "0 1px 2px rgba(0,0,0,.05)" }}>
+            {/* Rooms by Gender (existing) */}
+            <div
+              style={{
+                flex: "1 1 320px",
+                padding: 12,
+                background: "#fff",
+                borderRadius: 8,
+                boxShadow: "0 1px 2px rgba(0,0,0,.05)",
+              }}
+            >
               <p style={{ margin: 0, fontWeight: 600 }}>Rooms by Gender</p>
-              {/*
-                Build the data for the bar chart. ResponsiveContainer keeps the chart responsive.
-              */}
-              {(() => {
-                const genderData = [
-                    { name: "Male", value: roomsByGenderCounts.male },
-                    { name: "Female", value: roomsByGenderCounts.female },
-                    { name: "Any/Other", value: roomsByGenderCounts.any },
-                ];
-                const colors = ["#3b82f6", "#ec4899", "#6b7280"];
-                return (
-                  <div style={{ width: "100%", height: 180, marginTop: 8 }}>
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={genderData} margin={{ top: 8, right: 8, left: 8, bottom: 8 }}>
+              <div style={{ width: "100%", height: 180, marginTop: 8 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart
+                    data={[
+                      { name: "Male", value: roomsByGenderCounts.male },
+                      { name: "Female", value: roomsByGenderCounts.female },
+                      { name: "Any/Other", value: roomsByGenderCounts.any },
+                    ]}
+                    margin={{ top: 8, right: 8, left: 8, bottom: 8 }}
+                  >
                     <XAxis dataKey="name" tick={{ fontSize: 12 }} />
                     <YAxis allowDecimals={false} tick={{ fontSize: 12 }} width={24} />
-                    <Tooltip formatter={(v: any) => [v, "Rooms"]} />
-                        <Bar dataKey="value" barSize={36}>
-                          {genderData.map((entry, idx) => (
-                            <Cell key={`c-${idx}`} fill={colors[idx % colors.length]} />
-                          ))}
-                        </Bar>
+                    <Tooltip formatter={(val: any) => [val, "Rooms"]} />
+                    <Bar dataKey="value" barSize={36} radius={[8, 8, 0, 0]}>
+                      <Cell fill="#3b82f6" />
+                      <Cell fill="#ec4899" />
+                      <Cell fill="#6b7280" />
+                    </Bar>
                   </BarChart>
                 </ResponsiveContainer>
               </div>
-                );
-              })()}
             </div>
 
-            <div style={{ flex: "0 0 240px", padding: 12, background: "#fff", borderRadius: 8, boxShadow: "0 1px 2px rgba(0,0,0,.05)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-              <p style={{ margin: 0, fontWeight: 600 }}>Rooms with CR</p>
-              {(() => {
-                const crData = [
-                  { name: "With CR", value: roomsWithCR },
-                  { name: "Without CR", value: Math.max(0, totalRooms - roomsWithCR) },
-                ];
-                const CR_COLORS = ["#10b981", "#e5e7eb"];
-                return (
-              <div style={{ width: "100%", height: 140, display: "flex", alignItems: "center", justifyContent: "center", marginTop: 8 }}>
+            {/* Occupancy Rate Gauge (new) */}
+            <div
+              style={{
+                flex: "0 1 260px",
+                padding: 12,
+                background: "#fff",
+                borderRadius: 8,
+                boxShadow: "0 1px 2px rgba(0,0,0,.05)",
+                position: "relative",
+                minHeight: 190,
+              }}
+            >
+              <p style={{ margin: 0, fontWeight: 600 }}>Occupancy Rate</p>
+              <div style={{ width: "100%", height: 150, marginTop: 8, position: "relative" }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <PieChart>
                     <Pie
-                          data={crData}
+                      data={[
+                        { name: "Occupied", value: occupiedBeds },
+                        { name: "Available", value: Math.max(0, totalBeds - occupiedBeds) },
+                      ]}
+                      dataKey="value"
+                      startAngle={180}
+                      endAngle={0}
+                      innerRadius="65%"
+                      outerRadius="95%"
+                      stroke="none"
+                    >
+                      <Cell fill="#3b82f6" />
+                      <Cell fill="#e5e7eb" />
+                    </Pie>
+                  </PieChart>
+                </ResponsiveContainer>
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    pointerEvents: "none",
+                    transform: "translateY(10px)",
+                  }}
+                >
+                  <div style={{ fontSize: 24, fontWeight: 700 }}>
+                    {totalBeds > 0 ? `${occupancyPercent}%` : "—"}
+                  </div>
+                  <div style={{ fontSize: 12, color: "#6b7280" }}>
+                    {totalBeds > 0 ? `${occupiedBeds} of ${totalBeds} beds occupied` : "No bed data"}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Rooms with CR (existing) */}
+            <div
+              style={{
+                flex: "0 1 240px",
+                padding: 12,
+                background: "#fff",
+                borderRadius: 8,
+                boxShadow: "0 1px 2px rgba(0,0,0,.05)",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+              }}
+            >
+              <p style={{ margin: 0, fontWeight: 600 }}>Rooms with CR</p>
+              <div
+                style={{
+                  width: "100%",
+                  height: 140,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  marginTop: 8,
+                }}
+              >
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie
+                      data={[
+                        { name: "With CR", value: roomsWithCR },
+                        { name: "Without CR", value: Math.max(0, totalRooms - roomsWithCR) },
+                      ]}
                       innerRadius={34}
                       outerRadius={56}
-                          dataKey="value"
+                      dataKey="value"
                       startAngle={90}
                       endAngle={-270}
                       labelLine={false}
                     >
-                          {crData.map((entry, idx) => (
-                            <Cell key={`cr-${idx}`} fill={CR_COLORS[idx % CR_COLORS.length]} />
-                          ))}
+                      <Cell fill="#10b981" />
+                      <Cell fill="#e5e7eb" />
                     </Pie>
                     <Legend verticalAlign="bottom" height={24} />
                   </PieChart>
                 </ResponsiveContainer>
               </div>
-                );
-              })()}
               <div style={{ marginTop: 6, textAlign: "center" }}>
                 <div style={{ fontSize: 20, fontWeight: 700 }}>{roomsWithCRPercent}%</div>
-                <div style={{ fontSize: 12, color: "#6b7280" }}>{roomsWithCR} of {totalRooms} rooms</div>
+                <div style={{ fontSize: 12, color: "#6b7280" }}>
+                  {roomsWithCR} of {totalRooms} rooms
+                </div>
               </div>
             </div>
+
+            {/* Amenities Distribution (new) */}
+            <div
+              style={{
+                flex: "1 1 420px",
+                padding: 12,
+                background: "#fff",
+                borderRadius: 8,
+                boxShadow: "0 1px 2px rgba(0,0,0,.05)",
+              }}
+            >
+              <p style={{ margin: 0, fontWeight: 600 }}>Amenities Distribution</p>
+              <div style={{ width: "100%", height: 220, marginTop: 8 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={amenityData} margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                    <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                    <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
+                    <Tooltip formatter={(val: any) => [val, "Rooms"]} />
+                    <Bar dataKey="count" fill="#3b82f6" radius={[6, 6, 0, 0]} barSize={24} />
+                  </BarChart>
+                </ResponsiveContainer>
               </div>
             </div>
+
+            {/* Price Range Distribution (new) */}
+            <div
+              style={{
+                flex: "1 1 320px",
+                padding: 12,
+                background: "#fff",
+                borderRadius: 8,
+                boxShadow: "0 1px 2px rgba(0,0,0,.05)",
+              }}
+            >
+              <p style={{ margin: 0, fontWeight: 600 }}>Price Range Distribution</p>
+              <div style={{ width: "100%", height: 220, marginTop: 8 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={priceRangeData} margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                    <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                    <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
+                    <Tooltip formatter={(val: any) => [val, "Rooms"]} />
+                    <Bar dataKey="count" fill="#ec4899" radius={[6, 6, 0, 0]} barSize={24} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* Boardinghouse Performance Comparison (new) */}
+            <div
+              style={{
+                flex: "1 1 100%",
+                padding: 12,
+                background: "#fff",
+                borderRadius: 8,
+                boxShadow: "0 1px 2px rgba(0,0,0,.05)",
+              }}
+            >
+              <p style={{ margin: 0, fontWeight: 600 }}>Boardinghouse Performance Comparison</p>
+              <div style={{ width: "100%", height: 260, marginTop: 8 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart
+                    data={performanceData}
+                    margin={{ top: 8, right: 12, left: 8, bottom: 48 }}
+                  >
+                    <XAxis
+                      dataKey="name"
+                      tick={{ fontSize: 12 }}
+                      angle={-20}
+                      textAnchor="end"
+                      interval={0}
+                      height={60}
+                    />
+                    <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
+                    <Tooltip />
+                    <Legend />
+                    <Bar dataKey="total" fill="#06b6d4" name="Total Rooms" barSize={16} />
+                    <Bar dataKey="available" fill="#10b981" name="Available Rooms" barSize={16} />
+                    <Bar dataKey="occupied" fill="#3b82f6" name="Occupied Rooms" barSize={16} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        </div>
 
         {/* Quick Actions */}
         <div className="dashboard-section">
