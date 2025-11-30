@@ -3,32 +3,14 @@ import { Link, useNavigate } from "react-router-dom";
 import { ArrowLeft, Heart } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import "../styles/interface.css";
-
-type Room = {
-  id?: string;
-  roomName?: string;
-  rentPrice?: number;
-  totalBeds?: number;
-  availableBeds?: number;
-  gender?: string;
-  withCR?: boolean;
-  cookingAllowed?: boolean;
-  inclusions?: string[];
-};
-
-type Boardinghouse = {
-  id: string;
-  name: string;
-  description?: string;
-  address?: string;
-  photos?: string[];
-  rooms?: Room[];
-};
+import { getBoardinghouseById } from "@/lib/firestore";
+import type { BoardinghouseWithRooms } from "@/types/firestore";
 
 const Favorites = () => {
   const navigate = useNavigate();
   const [favorites, setFavorites] = useState<string[]>([]);
-  const [boardinghouses, setBoardinghouses] = useState<Boardinghouse[]>([]);
+  const [boardinghouses, setBoardinghouses] = useState<BoardinghouseWithRooms[]>([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     try {
@@ -40,19 +22,26 @@ const Favorites = () => {
   }, []);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem("boardinghouses");
-      const parsed = raw ? JSON.parse(raw) : [];
-      setBoardinghouses(Array.isArray(parsed) ? parsed : []);
-    } catch {
-      setBoardinghouses([]);
-    }
-  }, []);
-
-  const favoriteHouses = useMemo(
-    () => boardinghouses.filter((bh) => favorites.includes(bh.id)),
-    [boardinghouses, favorites]
-  );
+    const fetchFavorites = async () => {
+      if (favorites.length === 0) {
+        setBoardinghouses([]);
+        setLoading(false);
+        return;
+      }
+      setLoading(true);
+      try {
+        const promises = favorites.map(id => getBoardinghouseById(id));
+        const results = await Promise.all(promises);
+        const found = results.filter((b): b is BoardinghouseWithRooms => b !== null);
+        setBoardinghouses(found);
+      } catch (err) {
+        console.error("Failed to load favorites", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchFavorites();
+  }, [favorites]);
 
   const toggleFavorite = (id: string) => {
     setFavorites((prev) => {
@@ -72,20 +61,26 @@ const Favorites = () => {
           <h1 className="text-3xl font-bold text-foreground">Favorite Boardinghouses</h1>
         </div>
 
-        {favoriteHouses.length === 0 ? (
+        {loading ? (
+           <div className="text-center py-10">Loading favorites...</div>
+        ) : boardinghouses.length === 0 ? (
           <div className="bg-white rounded-2xl shadow-inner border border-dashed border-slate-300 p-10 text-center text-slate-600">
             No favorites yet. Go back to add some!
           </div>
         ) : (
           <div className="space-y-6">
-            {favoriteHouses.map((property) => {
+            {boardinghouses.map((property) => {
               const firstPricedRoom = property.rooms?.find(
-                (room) => typeof room?.rentPrice === "number"
+                (room) => typeof room?.price === "number"
               );
               const formattedPrice =
-                firstPricedRoom && Number.isFinite(firstPricedRoom.rentPrice)
-                  ? `₱${Number(firstPricedRoom.rentPrice).toLocaleString()} / month`
+                firstPricedRoom && Number.isFinite(firstPricedRoom.price)
+                  ? `₱${Number(firstPricedRoom.price).toLocaleString()} / month`
                   : "Price not available";
+
+              // Construct address from flat fields
+              const addressParts = [property.street, property.barangay, property.city, property.province].filter(Boolean);
+              const address = addressParts.join(", ");
 
               return (
                 <div
@@ -114,7 +109,7 @@ const Favorites = () => {
                       <h3 className="text-3xl font-bold mb-4">{property.name}</h3>
                       <p className="text-white/90 mb-4 line-clamp-4">{property.description}</p>
 
-                      <div className="text-sm mb-2 text-white/80">{property.address}</div>
+                      <div className="text-sm mb-2 text-white/80">{address}</div>
 
                       <div className="text-2xl font-bold mb-4">{formattedPrice}</div>
 

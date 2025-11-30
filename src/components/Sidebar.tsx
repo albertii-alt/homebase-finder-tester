@@ -1,19 +1,35 @@
 import { Home, Building2, Plus, Settings, LogOut, ChevronDown, Menu, X } from "lucide-react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
+import { onAuthStateChanged, signOut as firebaseSignOut } from "firebase/auth";
 import LogoutModal from "@/components/LogoutModal"; // added import
+import { auth } from "@/firebase/config";
+import { getUserDoc } from "@/lib/firestore";
+import { useToast } from "@/hooks/use-toast";
+import type { UserRole } from "@/types/firestore";
 
 type CurrentUser = {
-  name?: string;
-  email?: string;
-  role?: string;
-  avatar?: string;
-  loggedIn?: boolean;
+  uid: string;
+  name: string;
+  email: string;
+  role: UserRole;
+  avatar: string;
+  loggedIn: boolean;
 };
+
+const createGuestUser = (): CurrentUser => ({
+  uid: "",
+  name: "Guest",
+  email: "",
+  role: "tenant",
+  avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent("Guest")}`,
+  loggedIn: false,
+});
 
 export const Sidebar = () => {
   const location = useLocation();
   const navigate = useNavigate();
+  const { toast } = useToast();
   const [isMobile, setIsMobile] = useState<boolean>(() => {
     if (typeof window === "undefined") {
       return false;
@@ -65,46 +81,82 @@ export const Sidebar = () => {
     }
   }, [location.pathname, isMobile]);
 
-  // load current user from localStorage and keep it reactive across tabs
-  const readUser = (): CurrentUser => {
+  useEffect(() => {
+    let active = true;
+
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!active) return;
+
+      if (!firebaseUser) {
+        const guest = createGuestUser();
+        setUser(guest);
+        persistLocalUser(null);
+        return;
+      }
+
+      try {
+        const profile = await getUserDoc(firebaseUser.uid);
+        if (!active) return;
+
+        if (!profile) {
+          await firebaseSignOut(auth).catch(() => undefined);
+          const guest = createGuestUser();
+          setUser(guest);
+          persistLocalUser(null);
+          toast({ title: "Profile missing", description: "Please sign in again." });
+          navigate("/auth");
+          return;
+        }
+
+        const resolved: CurrentUser = {
+          uid: firebaseUser.uid,
+          name: profile.fullName || firebaseUser.displayName || firebaseUser.email || "User",
+          email: firebaseUser.email ?? profile.email ?? "",
+          role: profile.role,
+          avatar:
+            firebaseUser.photoURL ??
+            `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(
+              profile.fullName || firebaseUser.email || "User"
+            )}`,
+          loggedIn: true,
+        };
+
+        setUser(resolved);
+        persistLocalUser(resolved);
+      } catch (error) {
+        console.error("Sidebar failed to sync user", error);
+      }
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [navigate, toast]);
+
+  const [user, setUser] = useState<CurrentUser>(() => createGuestUser());
+  const [showLogoutModal, setShowLogoutModal] = useState(false);
+
+  const persistLocalUser = (profile: CurrentUser | null) => {
     try {
-      const raw =
-        typeof window !== "undefined" ? localStorage.getItem("currentUser") : null;
-      const parsed = raw ? JSON.parse(raw) : null;
-      return {
-        name: parsed?.name ?? "Guest",
-        email: parsed?.email ?? "",
-        role: (parsed?.role ?? "tenant").toString(),
-        avatar:
-          parsed?.avatar ??
-          `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(
-            parsed?.name ?? "Guest"
-          )}`,
-        loggedIn: parsed?.loggedIn ?? false,
-      };
+      if (!profile) {
+        localStorage.removeItem("currentUser");
+        return;
+      }
+      localStorage.setItem("currentUser", JSON.stringify(profile));
     } catch {
-      return {
-        name: "Guest",
-        email: "",
-        role: "tenant",
-        avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=Guest`,
-        loggedIn: false,
-      };
+      // ignore storage failures
     }
   };
 
-  const [user, setUser] = useState<CurrentUser>(() => readUser());
-  const [showLogoutModal, setShowLogoutModal] = useState(false);
-
-  useEffect(() => {
-    const onStorage = () => setUser(readUser());
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, []);
-
-  const performLogout = () => {
-    localStorage.removeItem("currentUser");
-    setUser(readUser());
+  const performLogout = async () => {
+    try {
+      await firebaseSignOut(auth);
+    } catch {
+      // ignore
+    }
+    persistLocalUser(null);
+    setUser(createGuestUser());
     navigate("/auth");
   };
   const handleLogoutClick = () => setShowLogoutModal(true);
@@ -384,8 +436,7 @@ export const Sidebar = () => {
         open={showLogoutModal}
         onClose={() => setShowLogoutModal(false)}
         onConfirm={() => {
-          performLogout();
-          setShowLogoutModal(false);
+          void performLogout().finally(() => setShowLogoutModal(false));
         }}
       />
       </div>

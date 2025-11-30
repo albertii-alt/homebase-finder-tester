@@ -2,83 +2,33 @@ import { ArrowLeft, MapPin, User, BedDouble, Utensils, Wifi, Zap, Droplets, Fan,
 import { Link, useParams } from "react-router-dom";
 import "../styles/boardinghouse.css";
 import React from "react";
-
-type Room = {
-  id?: string;
-  number?: string;
-  roomName?: string;
-  totalBeds?: number;
-  availableBeds?: number;
-  beds?: number;
-  gender?: string;
-  withCR?: boolean;
-  cooking?: boolean;
-  cookingAllowed?: boolean;
-  price?: string;
-  rentPrice?: string | number;
-  status?: string;
-  inclusions?: string[];
-};
-
-type Boardinghouse = {
-  id: string;
-  name?: string;
-  location?: string;
-  address?: string;
-  description?: string;
-  photos?: string[];
-  owner?: {
-    name?: string;
-    contact?: string;
-    email?: string;
-  };
-  ownerName?: string;
-  contact?: string;
-  facebook?: string;
-  totalRooms?: number;
-  availableRooms?: number;
-  rooms?: Room[];
-  structuredAddress?: {
-    street?: string;
-    barangay_name?: string;
-    barangay?: string;
-    city_name?: string;
-    city?: string;
-    province_name?: string;
-    province?: string;
-    region_name?: string;
-    region?: string;
-    [k: string]: any;
-  };
-};
+import { getBoardinghouseById } from "@/lib/firestore";
+import type { BoardinghouseWithRooms } from "@/types/firestore";
 
 export default function BoardinghouseDetails() {
   const { id } = useParams<{ id: string }>();
 
-  const [boardinghouse, setBoardinghouse] = React.useState<Boardinghouse | null | undefined>(undefined);
+  const [boardinghouse, setBoardinghouse] = React.useState<BoardinghouseWithRooms | null | undefined>(undefined);
 
   // Lightbox / carousel state
   const [lightboxOpen, setLightboxOpen] = React.useState(false);
   const [lightboxIndex, setLightboxIndex] = React.useState<number>(0);
 
   React.useEffect(() => {
-    try {
-      const raw = localStorage.getItem("boardinghouses");
-      if (!raw) {
-        setBoardinghouse(null);
-        return;
-      }
-      const list = JSON.parse(raw) as Boardinghouse[] | null;
-      if (!Array.isArray(list)) {
-        setBoardinghouse(null);
-        return;
-      }
-      const found = list.find((b) => String(b.id) === String(id));
-      setBoardinghouse(found ?? null);
-    } catch (err) {
-      console.warn("Failed to load boardinghouses from localStorage", err);
+    if (!id) {
       setBoardinghouse(null);
+      return;
     }
+    const fetchBh = async () => {
+      try {
+        const found = await getBoardinghouseById(id);
+        setBoardinghouse(found);
+      } catch (err) {
+        console.warn("Failed to load boardinghouse from Firestore", err);
+        setBoardinghouse(null);
+      }
+    };
+    fetchBh();
   }, [id]);
 
   // keyboard navigation for lightbox
@@ -146,29 +96,23 @@ export default function BoardinghouseDetails() {
   }
 
   // boardinghouse is guaranteed to be non-null here
-  const sa = boardinghouse.structuredAddress ?? null;
-
+  
   // upper address: street, barangay, city/municipality, province
   const upperAddressParts: string[] = [];
-  if (sa) {
-    if (sa.street) upperAddressParts.push(sa.street);
-    if (sa.barangay_name ?? sa.barangay) upperAddressParts.push((sa.barangay_name ?? sa.barangay) as string);
-    if (sa.city_name ?? sa.city) upperAddressParts.push((sa.city_name ?? sa.city) as string);
-    if (sa.province_name ?? sa.province) upperAddressParts.push((sa.province_name ?? sa.province) as string);
-  } else if (boardinghouse.address) {
-    // best-effort fallback: use the full address string as upper line if structuredAddress absent
-    upperAddressParts.push(boardinghouse.address);
-  }
+  if (boardinghouse.street) upperAddressParts.push(boardinghouse.street);
+  if (boardinghouse.barangay) upperAddressParts.push(boardinghouse.barangay);
+  if (boardinghouse.city) upperAddressParts.push(boardinghouse.city);
+  if (boardinghouse.province) upperAddressParts.push(boardinghouse.province);
+  
   const upperAddress = upperAddressParts.filter(Boolean).join(", ");
 
   // sub address: region only
-  const regionOnly = sa?.region_name ?? sa?.region ?? "";
+  const regionOnly = boardinghouse.region ?? "";
 
-  // owner info: prefer ownerName/contact/facebook fields saved on boardinghouse (Edit/Add use ownerName/contact/facebook)
-  const ownerName = boardinghouse.ownerName ?? boardinghouse.owner?.name ?? "—";
-  const ownerContact = boardinghouse.contact ?? boardinghouse.owner?.contact ?? "—";
-  // per request: show facebook (owner's facebook URL/account) in place of email in details
-  const ownerEmailOrFacebook = boardinghouse.facebook ?? boardinghouse.owner?.email ?? "—";
+  // owner info
+  const ownerName = boardinghouse.ownerName ?? "—";
+  const ownerContact = boardinghouse.contact ?? "—";
+  const ownerEmailOrFacebook = boardinghouse.facebook ?? "—";
 
   const photos = boardinghouse.photos ?? [];
 
@@ -218,7 +162,7 @@ export default function BoardinghouseDetails() {
                   {boardinghouse.totalRooms ?? (boardinghouse.rooms?.length ?? 0)}
                 </div>
                 <div className="text-sm mt-1" style={{ color: "#666" }}>
-                  {boardinghouse.availableRooms ?? boardinghouse.rooms?.filter(r => Number((r.availableBeds ?? r.beds ?? 0)) > 0).length ?? 0} Available
+                  {boardinghouse.availableRooms ?? boardinghouse.rooms?.filter(r => Number((r.bedsAvailable ?? 0)) > 0).length ?? 0} Available
                 </div>
               </div>
             </div>
@@ -340,12 +284,12 @@ export default function BoardinghouseDetails() {
             <div className="space-y-4">
               {(boardinghouse.rooms && boardinghouse.rooms.length > 0) ? (
                 boardinghouse.rooms.map((room, index) => {
-                  const roomName = (room.roomName ?? room.number ?? room.id ?? `Room ${index + 1}`) as string;
-                  const totalBeds = (room.totalBeds ?? room.beds ?? 0) as number;
-                  const availableBeds = (room.availableBeds ?? room.beds ?? 0) as number;
-                  const price = (room.rentPrice ?? room.price ?? "") as string | number | undefined;
+                  const roomName = room.number || `Room ${index + 1}`;
+                  const totalBeds = room.beds ?? 0;
+                  const availableBeds = room.bedsAvailable ?? 0;
+                  const price = room.price ?? 0;
                   const withCR = room.withCR ?? false;
-                  const cooking = room.cookingAllowed ?? room.cooking ?? false;
+                  const cooking = room.cooking ?? false;
                   const gender = room.gender ?? "Any";
                   const inclusions = room.inclusions ?? [];
 
@@ -375,7 +319,7 @@ export default function BoardinghouseDetails() {
                             </span>
                           </div>
                           <div className="text-2xl font-bold mb-3" style={{ color: "#4a148c" }}>
-                            {price ? (typeof price === "number" ? `₱${price}` : price) : ""}
+                            {price ? `₱${price}` : ""}
                           </div>
                           <div className="grid grid-cols-2 gap-3 text-sm">
                             <div className="flex items-center gap-2" style={{ color: "#666" }}>
@@ -444,14 +388,14 @@ export default function BoardinghouseDetails() {
             <div className="form-container text-center">
               <div className="text-4xl mb-2">🍳</div>
               <div className="text-2xl font-bold" style={{ color: "#00a8cc" }}>
-                {(boardinghouse.rooms ?? []).filter(r => (r.cookingAllowed ?? r.cooking)).length}
+                {(boardinghouse.rooms ?? []).filter(r => r.cooking).length}
               </div>
               <div className="text-sm" style={{ color: "#666" }}>Cooking Allowed</div>
             </div>
             <div className="form-container text-center">
               <div className="text-4xl mb-2">🚪</div>
               <div className="text-2xl font-bold" style={{ color: "#00a8cc" }}>
-                {boardinghouse.availableRooms ?? (boardinghouse.rooms ?? []).filter(r => Number((r.availableBeds ?? r.beds ?? 0)) > 0).length}
+                {boardinghouse.rooms?.filter(r => Number(r.bedsAvailable) > 0).length ?? 0}
               </div>
               <div className="text-sm" style={{ color: "#666" }}>Available Now</div>
             </div>

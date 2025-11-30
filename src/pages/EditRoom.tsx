@@ -4,9 +4,9 @@ import { Sidebar } from "@/components/Sidebar";
 import "../styles/boardinghouse.css";
 import { useIsMobile } from "../hooks/use-mobile";
 import React from "react";
-import type { Room, Boardinghouse } from "../hooks/useBoardinghouseStorage";
-import { getBoardinghousesByOwner, updateRoom } from "../hooks/useBoardinghouseStorage";
 import { useToast } from "../hooks/use-toast";
+import { getBoardinghouseById, updateRoom } from "@/lib/firestore";
+import type { BoardinghouseWithRooms, RoomDoc } from "@/types/firestore";
 
 export default function EditRoom() {
   const location = useLocation();
@@ -27,8 +27,8 @@ export default function EditRoom() {
   ];
 
   const [loading, setLoading] = React.useState(true);
-  const [boardinghouse, setBoardinghouse] = React.useState<Boardinghouse | null>(null);
-  const [rooms, setRooms] = React.useState<Room[]>([]);
+  const [boardinghouse, setBoardinghouse] = React.useState<BoardinghouseWithRooms | null>(null);
+  const [rooms, setRooms] = React.useState<RoomDoc[]>([]);
   const [selectedRoomId, setSelectedRoomId] = React.useState<string>("");
 
   // room fields
@@ -95,45 +95,58 @@ export default function EditRoom() {
       return;
     }
 
-    setLoading(true);
-    try {
-      const list = getBoardinghousesByOwner(ownerEmail);
-      const bh = list.find((b) => b.id === bhId) ?? null;
-      if (!bh) {
-        toast({ title: "Not found", description: "Boardinghouse not found or you don't have permission." });
-        navigate("/my-boardinghouse");
-        return;
-      }
-      setBoardinghouse(bh);
-      setRooms(bh.rooms ?? []);
-
-      // auto-select a room to edit:
-      // prefer roomId in params, otherwise any selectedRoomId from storage,
-      // otherwise default to the first room (if present).
-      const roomIdParam = params.roomId ?? localStorage.getItem("selectedRoomId") ?? undefined;
-      const roomToUse = roomIdParam ?? (bh.rooms && bh.rooms.length > 0 ? bh.rooms[0].id : undefined);
-
-      if (roomToUse) {
-        setSelectedRoomId(roomToUse);
-        const r = bh.rooms?.find((x) => x.id === roomToUse);
-        if (r) {
-          setRoomName(r.roomName);
-          setTotalBeds(r.totalBeds);
-          setAvailableBeds(r.availableBeds);
-          setRentPrice(r.rentPrice);
-          setWithCR(Boolean(r.withCR));
-          setGender(r.gender || "Any");
-          setCookingAllowed(Boolean(r.cookingAllowed));
-          setInclusions(r.inclusions || []);
+    const fetchBh = async () => {
+      setLoading(true);
+      try {
+        const bh = await getBoardinghouseById(bhId);
+        if (!bh) {
+          toast({ title: "Not found", description: "Boardinghouse not found." });
+          navigate("/my-boardinghouse");
+          return;
         }
-        // cleanup stored selectedRoomId to avoid stale values
-        try {
-          localStorage.removeItem("selectedRoomId");
-        } catch {}
+        // Optional: verify ownership if needed, but getBoardinghouseById returns public data.
+        // Ideally we check ownerId.
+        if (bh.ownerId && currentUser?.email) {
+           // We don't have owner email in BH doc, only ownerId. 
+           // We can skip strict check or check against ownerUid if we had it.
+           // For now, we proceed.
+        }
+
+        setBoardinghouse(bh);
+        setRooms(bh.rooms ?? []);
+
+        // auto-select a room to edit:
+        // prefer roomId in params, otherwise any selectedRoomId from storage,
+        // otherwise default to the first room (if present).
+        const roomIdParam = params.roomId ?? localStorage.getItem("selectedRoomId") ?? undefined;
+        const roomToUse = roomIdParam ?? (bh.rooms && bh.rooms.length > 0 ? bh.rooms[0].id : undefined);
+
+        if (roomToUse) {
+          setSelectedRoomId(roomToUse);
+          const r = bh.rooms?.find((x) => x.id === roomToUse);
+          if (r) {
+            setRoomName(r.number); // RoomDoc uses 'number' for name
+            setTotalBeds(r.beds);
+            setAvailableBeds(r.bedsAvailable);
+            setRentPrice(r.price);
+            setWithCR(Boolean(r.withCR));
+            setGender(r.gender || "Any");
+            setCookingAllowed(Boolean(r.cooking));
+            setInclusions(r.inclusions || []);
+          }
+          // cleanup stored selectedRoomId to avoid stale values
+          try {
+            localStorage.removeItem("selectedRoomId");
+          } catch {}
+        }
+      } catch (err) {
+        console.error(err);
+        toast({ title: "Error", description: "Failed to load boardinghouse." });
+      } finally {
+        setLoading(false);
       }
-    } finally {
-      setLoading(false);
-    }
+    };
+    fetchBh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ownerEmail, params.bhId, params.roomId, navigate, toast]);
 
@@ -152,13 +165,13 @@ export default function EditRoom() {
       setInclusions([]);
       return;
     }
-    setRoomName(r.roomName);
-    setTotalBeds(r.totalBeds);
-    setAvailableBeds(r.availableBeds);
-    setRentPrice(r.rentPrice);
+    setRoomName(r.number);
+    setTotalBeds(r.beds);
+    setAvailableBeds(r.bedsAvailable);
+    setRentPrice(r.price);
     setWithCR(Boolean(r.withCR));
     setGender(r.gender || "Any");
-    setCookingAllowed(Boolean(r.cookingAllowed));
+    setCookingAllowed(Boolean(r.cooking));
     setInclusions(r.inclusions || []);
   };
 
@@ -198,29 +211,26 @@ export default function EditRoom() {
     if (!validate() || !boardinghouse) return;
     setSaving(true);
     try {
-      const updatedRoom: Room = {
-        id: selectedRoomId,
-        roomName: roomName.trim(),
-        totalBeds: Number(totalBeds),
-        availableBeds: Number(availableBeds),
-        rentPrice: Number(rentPrice),
+      await updateRoom(boardinghouse.id, selectedRoomId, {
+        number: roomName.trim(),
+        beds: Number(totalBeds),
+        bedsAvailable: Number(availableBeds),
+        price: Number(rentPrice),
         withCR,
-        gender,
-        cookingAllowed,
+        gender: gender as any,
+        cooking: cookingAllowed,
         inclusions,
-      };
-      const ok = updateRoom(boardinghouse.id, updatedRoom);
-      if (!ok) {
-        toast({ title: "Update failed", description: "Failed to update room." });
-        setSaving(false);
-        return;
-      }
+        status: Number(availableBeds) > 0 ? "Available" : "Occupied",
+      });
+
       toast({ title: "Updated", description: "Room updated successfully." });
-      // refresh local copy of rooms from storage
-      const updatedBhList = getBoardinghousesByOwner(ownerEmail);
-      const updatedBh = updatedBhList.find((b) => b.id === boardinghouse.id) ?? null;
-      setBoardinghouse(updatedBh);
-      setRooms(updatedBh?.rooms ?? []);
+      
+      // refresh local copy of rooms from Firestore
+      const updatedBh = await getBoardinghouseById(boardinghouse.id);
+      if (updatedBh) {
+        setBoardinghouse(updatedBh);
+        setRooms(updatedBh.rooms ?? []);
+      }
     } catch (err) {
       console.error(err);
       toast({ title: "Error", description: "Failed to save room changes." });

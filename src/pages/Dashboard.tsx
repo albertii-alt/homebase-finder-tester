@@ -1,11 +1,17 @@
 import { Building2, Bed, Bath, ChefHat, DoorOpen, Plus, Edit, Image, AlertCircle, TrendingUp, RefreshCw } from "lucide-react";
 import { Sidebar } from "@/components/Sidebar";
 import "../styles/dashboard.css";
+import "../styles/boardinghouse.css";
 import { useIsMobile } from "../hooks/use-mobile";
 import React from "react";
-import { getBoardinghousesByOwner, getAllRooms } from "../hooks/useBoardinghouseStorage";
 import { useToast } from "../hooks/use-toast";
 import { useNavigate } from "react-router-dom";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth, db } from "@/firebase/config";
+import { collection, query, where, getDocs, orderBy } from "firebase/firestore";
+import type { BoardinghouseWithRooms, RoomDoc } from "@/types/firestore";
+import { getUserDoc } from "@/lib/firestore";
+
 // Recharts for Data Overview
 import {
   ResponsiveContainer,
@@ -21,42 +27,24 @@ import {
 } from "recharts";
 
 const Dashboard = () => {
-  const isMobile = useIsMobile();
+  // Use local isMobile state to match Sidebar breakpoint (1024px)
+  const [isMobile, setIsMobile] = React.useState(false);
+  React.useEffect(() => {
+    const checkMobile = () => setIsMobile(window.innerWidth < 1024);
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
   const { toast } = useToast();
   const navigate = useNavigate();
 
-  // current user
-  const currentUser = React.useMemo(() => {
-    try {
-      return JSON.parse(localStorage.getItem("currentUser") ?? "null") as { email?: string; role?: string } | null;
-    } catch {
-      return null;
-    }
-  }, []);
+  const [currentUser, setCurrentUser] = React.useState<{ uid: string; email: string; role: string } | null>(null);
+  const [loadingAuth, setLoadingAuth] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
 
-  React.useEffect(() => {
-    if (!currentUser || currentUser.role !== "owner") {
-      toast({ title: "Access denied", description: "Dashboard is for owners only." });
-      navigate("/interface");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const [boardinghouses, setBoardinghouses] = React.useState(() => {
-    if (currentUser?.role === "owner" && currentUser.email) {
-      return getBoardinghousesByOwner(currentUser.email);
-    }
-    return [];
-  });
-
-  const [rooms, setRooms] = React.useState(() => {
-    // get all rooms then filter to owner's boardinghouses
-    if (currentUser?.role === "owner" && currentUser.email) {
-      const bhs = getBoardinghousesByOwner(currentUser.email);
-      return bhs.flatMap((b) => b.rooms || []);
-    }
-    return [];
-  });
+  const [boardinghouses, setBoardinghouses] = React.useState<BoardinghouseWithRooms[]>([]);
+  const [rooms, setRooms] = React.useState<RoomDoc[]>([]);
 
   // activity log and reminders
   const [activityLog, setActivityLog] = React.useState<
@@ -64,139 +52,170 @@ const Dashboard = () => {
   >([]);
   const [alerts, setAlerts] = React.useState<Array<{ id: string; message: string }>>([]);
 
-  const fetchData = React.useCallback(() => {
-    if (currentUser?.role === "owner" && currentUser.email) {
-      const bhs = getBoardinghousesByOwner(currentUser.email);
-      setBoardinghouses(bhs);
-      setRooms(bhs.flatMap((b) => b.rooms || []));
-      // build activity log: prefer stored activityLog, otherwise synthesize from data
-      try {
-        // Read raw value first. If an array exists (even empty) treat it as authoritative.
-        const raw = localStorage.getItem("activityLog");
-        const stored = raw ? JSON.parse(raw) : null;
-        if (Array.isArray(stored)) {
-          // Use stored array exactly (empty array means user cleared intentionally).
-          setActivityLog(stored.slice().sort((a: any, b: any) => (b.ts || 0) - (a.ts || 0)));
-        } else {
-          const synthetic: Array<{ ts: number; message: string; type?: string; meta?: any }> = [];
-          const now = Date.now();
-          bhs.forEach((bh, i) => {
-            // use bh.updatedAt if exists, otherwise synthetic timestamp
-            const ts = (bh as any).updatedAt ? Number((bh as any).updatedAt) : now - i * 1000;
-            synthetic.push({ ts, message: `Boardinghouse saved: ${bh.name || "(no name)"}`, type: "boardinghouse", meta: { id: bh.id } });
-            (bh.rooms || []).forEach((r: any, j: number) => {
-              const rts = r.updatedAt ? Number(r.updatedAt) : now - (i + j + 1) * 1000;
-              synthetic.push({ ts: rts, message: `Room saved: ${r.roomName || "(no name)"} — ${bh.name || ""}`, type: "room", meta: { bhId: bh.id, roomId: r.id } });
-            });
-          });
-          setActivityLog(synthetic.sort((a, b) => b.ts - a.ts));
+  React.useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        try {
+          const profile = await getUserDoc(user.uid);
+          if (profile && profile.role === "owner") {
+            setCurrentUser({ uid: user.uid, email: user.email || "", role: "owner" });
+          } else {
+            toast({ title: "Access denied", description: "Dashboard is for owners only." });
+            navigate("/interface");
+          }
+        } catch (e) {
+          console.error("Error fetching user profile", e);
         }
-      } catch {
-        setActivityLog([]);
+      } else {
+        navigate("/auth");
+      }
+      setLoadingAuth(false);
+    });
+    return () => unsubscribe();
+  }, [navigate, toast]);
+
+  const fetchData = React.useCallback(async () => {
+    if (!currentUser) return;
+
+    try {
+      // Fetch boardinghouses for this owner
+      const q = query(
+        collection(db, "boardinghouses"),
+        where("ownerId", "==", currentUser.uid),
+        orderBy("createdAt", "desc")
+      );
+      const snapshot = await getDocs(q);
+      
+      const bhList: BoardinghouseWithRooms[] = [];
+      const allRooms: RoomDoc[] = [];
+
+      for (const docSnap of snapshot.docs) {
+        const data = docSnap.data();
+        const bhId = docSnap.id;
+        
+        // Fetch rooms for each boardinghouse
+        const roomsRef = collection(db, "boardinghouses", bhId, "rooms");
+        const roomsSnap = await getDocs(roomsRef);
+        
+        const bhRooms: RoomDoc[] = roomsSnap.docs.map(r => {
+          const rData = r.data();
+          return {
+            id: r.id,
+            boardinghouseId: bhId,
+            number: rData.number || rData.roomName || "",
+            beds: Number(rData.beds || rData.totalBeds || 0),
+            bedsAvailable: Number(rData.bedsAvailable || rData.availableBeds || 0),
+            gender: rData.gender || "Any",
+            withCR: Boolean(rData.withCR || rData.cr),
+            cooking: Boolean(rData.cooking || rData.cookingAllowed),
+            price: Number(rData.price || rData.rentPrice || 0),
+            status: rData.status || "Available",
+            inclusions: rData.inclusions || [],
+            createdAt: rData.createdAt,
+            updatedAt: rData.updatedAt
+          } as RoomDoc;
+        });
+
+        allRooms.push(...bhRooms);
+
+        bhList.push({
+          id: bhId,
+          ownerId: data.ownerId,
+          name: data.name,
+          region: data.region,
+          province: data.province,
+          city: data.city,
+          barangay: data.barangay,
+          street: data.street,
+          zipcode: data.zipcode,
+          description: data.description,
+          photos: data.photos || [],
+          ownerName: data.ownerName,
+          contact: data.contact,
+          facebook: data.facebook,
+          createdAt: data.createdAt,
+          updatedAt: data.updatedAt,
+          totalRooms: data.totalRooms,
+          rooms: bhRooms
+        } as BoardinghouseWithRooms);
       }
 
-      // read dismissed alerts so we don't show dismissed ones
-      const dismissed = (JSON.parse(localStorage.getItem("dismissedAlerts") ?? "[]") as string[]) || [];
-      // build reminders/alerts for missing required fields (per boardinghouse)
-      const newAlerts: Array<{ id: string; message: string }> = [];
-      bhs.forEach((bh) => {
-        const bhRooms = bh.rooms || [];
-        // missing rooms
-        if (bhRooms.length === 0) {
-          newAlerts.push({ id: `bh-${bh.id}-norooms`, message: `Boardinghouse "${bh.name || bh.id}" has no rooms.` });
+      setBoardinghouses(bhList);
+      setRooms(allRooms);
+
+      // Synthesize activity log from timestamps
+      const synthetic: Array<{ ts: number; message: string; type?: string; meta?: any }> = [];
+      
+      const getTs = (val: any) => {
+        if (!val) return Date.now();
+        if (typeof val.toMillis === "function") return val.toMillis();
+        if (val instanceof Date) return val.getTime();
+        if (typeof val === "string") {
+          const t = new Date(val).getTime();
+          return Number.isNaN(t) ? Date.now() : t;
         }
+        if (typeof val === "number") return val;
+        return Date.now();
+      };
 
-        // per-room missing fields
-        bhRooms.forEach((r: any) => {
-          if (!r.roomName || !String(r.roomName).trim()) {
-            newAlerts.push({ id: `bh-${bh.id}-room-${r.id}-name`, message: `Boardinghouse "${bh.name || bh.id}" — Room (${r.id}) is missing a name.` });
-          }
-          if (r.totalBeds == null || r.totalBeds === "") {
-            newAlerts.push({ id: `bh-${bh.id}-room-${r.id}-totalBeds`, message: `Boardinghouse "${bh.name || bh.id}" — Room "${r.roomName || r.id}" is missing total beds.` });
-          }
-          if (r.rentPrice == null || r.rentPrice === "") {
-            newAlerts.push({ id: `bh-${bh.id}-room-${r.id}-rent`, message: `Boardinghouse "${bh.name || bh.id}" — Room "${r.roomName || r.id}" is missing rent price.` });
-          }
-        });
-
-        // boardinghouse-level missing fields (AddBoardinghouse / EditBoardinghouse)
-        // list of required fields shown on the Add/Edit pages
-        const bhMissing: Array<{ key: string; label: string }> = [
-          { key: "ownerName", label: "Owner Name" },
-          { key: "contact", label: "Contact No." },
-          { key: "name", label: "Boardinghouse Name" },
-          { key: "description", label: "Description" },
-          { key: "facebook", label: "Facebook Page URL" },
-        ];
-
-        // structured address parts
-        const sa: any = (bh as any).structuredAddress ?? {};
-        const addrMissing: Array<{ key: string; label: string; present: boolean }> = [
-          { key: "region", label: "Region", present: Boolean(sa.region || sa.region_code) },
-          { key: "province", label: "Province", present: Boolean(sa.province || sa.province_code) },
-          { key: "city", label: "City / Municipality", present: Boolean(sa.city || sa.city_code) },
-          { key: "barangay", label: "Barangay", present: Boolean(sa.barangay || sa.barangay_code) },
-          { key: "street", label: "Street / House No.", present: Boolean(sa.street) },
-          { key: "zip", label: "Zip Code", present: Boolean(sa.zip) },
-        ];
-
-        bhMissing.forEach((f) => {
-          if (!(bh as any)[f.key] || !String((bh as any)[f.key]).trim()) {
-            newAlerts.push({ id: `bh-${bh.id}-missing-${f.key}`, message: `Boardinghouse "${bh.name || bh.id}" is missing: ${f.label} (Add/Edit Boardinghouse page).` });
-          }
-        });
-
-        addrMissing.forEach((a) => {
-          if (!a.present) {
-            newAlerts.push({ id: `bh-${bh.id}-missing-addr-${a.key}`, message: `Boardinghouse "${bh.name || bh.id}" is missing address field: ${a.label} (Add/Edit Boardinghouse page).` });
-          }
-        });
-
-        // photos check - notify if no photos uploaded
-        const photos = (bh as any).photos || [];
-        if (!Array.isArray(photos) || photos.length === 0) {
-          newAlerts.push({ id: `bh-${bh.id}-missing-photos`, message: `Boardinghouse "${bh.name || bh.id}" has no photos. (Add/Edit Boardinghouse page)` });
+      bhList.forEach(bh => {
+        if (bh.updatedAt) {
+          synthetic.push({ ts: getTs(bh.updatedAt), message: `Boardinghouse updated: ${bh.name}`, type: "boardinghouse", meta: { id: bh.id } });
+        } else if (bh.createdAt) {
+          synthetic.push({ ts: getTs(bh.createdAt), message: `Boardinghouse created: ${bh.name}`, type: "boardinghouse", meta: { id: bh.id } });
         }
       });
-      // filter out any dismissed alerts before setting state
+      // Sort by newest
+      synthetic.sort((a, b) => b.ts - a.ts);
+      setActivityLog(synthetic.slice(0, 50));
+
+      // Build alerts
+      const newAlerts: Array<{ id: string; message: string }> = [];
+      let dismissed: string[] = [];
+      try {
+        dismissed = (JSON.parse(localStorage.getItem("dismissedAlerts") ?? "[]") as string[]) || [];
+      } catch {
+        dismissed = [];
+      }
+
+      bhList.forEach((bh) => {
+        const bhRooms = bh.rooms || [];
+        if (bhRooms.length === 0) {
+          newAlerts.push({ id: `bh-${bh.id}-norooms`, message: `Boardinghouse "${bh.name}" has no rooms.` });
+        }
+        
+        // per-room missing fields
+        bhRooms.forEach((r: any) => {
+          if (!r.number || !String(r.number).trim()) {
+            newAlerts.push({ id: `bh-${bh.id}-room-${r.id}-name`, message: `Boardinghouse "${bh.name || bh.id}" — Room (${r.id}) is missing a number/name.` });
+          }
+          if (r.beds == null || r.beds === "") {
+            newAlerts.push({ id: `bh-${bh.id}-room-${r.id}-beds`, message: `Boardinghouse "${bh.name || bh.id}" — Room "${r.number || r.id}" is missing total beds.` });
+          }
+          if (r.price == null || r.price === "") {
+            newAlerts.push({ id: `bh-${bh.id}-room-${r.id}-price`, message: `Boardinghouse "${bh.name || bh.id}" — Room "${r.number || r.id}" is missing rent price.` });
+          }
+        });
+
+        // Check for missing photos
+        if (!bh.photos || bh.photos.length === 0) {
+          newAlerts.push({ id: `bh-${bh.id}-nophotos`, message: `Boardinghouse "${bh.name}" has no photos.` });
+        }
+      });
       setAlerts(newAlerts.filter((a) => !dismissed.includes(a.id)));
-    } else {
-      setBoardinghouses([]);
-      setRooms([]);
-      setActivityLog([]);
-      setAlerts([]);
+
+    } catch (err) {
+      console.error("Failed to fetch dashboard data", err);
+      setError("Failed to load dashboard data. Please try refreshing.");
+      toast({ title: "Error", description: "Failed to load dashboard data." });
     }
-  }, [currentUser?.email, currentUser?.role]);
+  }, [currentUser, toast]);
 
   React.useEffect(() => {
-    fetchData();
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === "boardinghouses" || e.key === "activityLog" || e.key === "alertsCleared") fetchData();
-    };
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, [fetchData]);
-
-  const totalBoardinghouses = boardinghouses.length;
-  const totalRooms = rooms.length;
-  const roomsWithCR = rooms.filter((r) => Boolean(r.withCR)).length;
-  const roomsWithCooking = rooms.filter((r) => Boolean(r.cookingAllowed)).length;
-  const availableRooms = rooms.filter((r) => Number(r.availableBeds) > 0).length;
-
-  const summaryStats = [
-    { icon: Building2, title: "Total Boardinghouses", value: totalBoardinghouses, color: "#06b6d4" },
-    { icon: Bed, title: "Total Rooms", value: totalRooms, color: "#3b82f6" },
-    { icon: Bath, title: "Rooms with CR", value: roomsWithCR, color: "#8b5cf6" },
-    { icon: ChefHat, title: "Rooms with Cooking Allowed", value: roomsWithCooking, color: "#10b981" },
-    { icon: DoorOpen, title: "Available Rooms", value: availableRooms, color: "#f59e0b" },
-  ];
-
-  const roomsDetailed = React.useMemo(() => {
-    return rooms.map((r) => ({
-      ...r,
-      boardinghouseName: boardinghouses.find((b) => (b.rooms || []).some((rr) => rr.id === r.id))?.name ?? "Unknown",
-    })) as Array<typeof rooms[number] & { boardinghouseName: string }>;
-  }, [boardinghouses, rooms]);
+    if (currentUser) {
+      fetchData();
+    }
+  }, [currentUser, fetchData]);
 
   const handleRefresh = () => {
     fetchData();
@@ -250,7 +269,7 @@ const Dashboard = () => {
     setAlerts(next);
     toast({ title: "Reminder dismissed" });
   };
-  
+
   // single expand/collapse state controlling both sections
   const [expandedAll, setExpandedAll] = React.useState(false);
   const LIST_COLLAPSE_COUNT = 5; // show up to 5 items when collapsed
@@ -363,8 +382,8 @@ const Dashboard = () => {
   const { totalBeds, occupiedBeds, occupancyPercent } = React.useMemo(() => {
     const totals = rooms.reduce(
       (acc, room) => {
-        const total = Number(room.totalBeds) || 0;
-        const available = Number(room.availableBeds) || 0;
+        const total = Number(room.beds) || 0;
+        const available = Number(room.bedsAvailable) || 0;
         acc.total += total;
         acc.occupied += Math.max(0, total - available);
         return acc;
@@ -392,7 +411,7 @@ const Dashboard = () => {
       if (inclusions.some((item) => item.includes("aircon") || item.includes("air-con") || item.includes("ac")))
         counts.aircon += 1;
       if (inclusions.some((item) => item.includes("fan"))) counts.fan += 1;
-      if (room.cookingAllowed) counts.cooking += 1;
+      if (room.cooking) counts.cooking += 1;
       if (room.withCR) counts.privateCR += 1;
     });
     return [
@@ -412,7 +431,7 @@ const Dashboard = () => {
       { label: "2000+", min: 2000, max: Infinity, count: 0 },
     ];
     rooms.forEach((room) => {
-      const price = Number(room.rentPrice);
+      const price = Number(room.price);
       if (!Number.isFinite(price)) return;
       const bucket = buckets.find((b) => price >= b.min && price <= b.max);
       if (bucket) bucket.count += 1;
@@ -424,7 +443,7 @@ const Dashboard = () => {
     return boardinghouses.map((bh) => {
       const bhRooms = bh.rooms || [];
       const total = bhRooms.length;
-      const available = bhRooms.filter((room) => Number(room.availableBeds) > 0).length;
+      const available = bhRooms.filter((room) => Number(room.bedsAvailable) > 0).length;
       return {
         name: bh.name || "Untitled",
         total,
@@ -435,8 +454,50 @@ const Dashboard = () => {
   }, [boardinghouses]);
   // ----- end helpers -----
 
+  const totalBoardinghouses = boardinghouses.length;
+  const totalRooms = rooms.length;
+  const roomsWithCR = rooms.filter((r) => Boolean(r.withCR)).length;
+  const roomsWithCooking = rooms.filter((r) => Boolean(r.cooking)).length;
+  const availableRooms = rooms.filter((r) => Number(r.bedsAvailable) > 0).length;
+
+  const summaryStats = [
+    { icon: Building2, title: "Total Boardinghouses", value: totalBoardinghouses, color: "#06b6d4" },
+    { icon: Bed, title: "Total Rooms", value: totalRooms, color: "#3b82f6" },
+    { icon: Bath, title: "Rooms with CR", value: roomsWithCR, color: "#8b5cf6" },
+    { icon: ChefHat, title: "Rooms with Cooking Allowed", value: roomsWithCooking, color: "#10b981" },
+    { icon: DoorOpen, title: "Available Rooms", value: availableRooms, color: "#f59e0b" },
+  ];
+
   const roomsWithCRPercent = totalRooms > 0 ? Math.round((roomsWithCR / totalRooms) * 100) : 0;
   const maxGenderCount = Math.max(1, roomsByGenderCounts.male, roomsByGenderCounts.female, roomsByGenderCounts.any);
+
+  const roomsDetailed = React.useMemo(() => {
+    return rooms.map((r) => ({
+      ...r,
+      roomName: r.number, // Map number to roomName for display compatibility
+      boardinghouseName: boardinghouses.find((b) => (b.rooms || []).some((rr) => rr.id === r.id))?.name ?? "Unknown",
+    })) as Array<typeof rooms[number] & { roomName: string; boardinghouseName: string }>;
+  }, [boardinghouses, rooms]);
+
+  if (loadingAuth) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
+        <div style={{ fontSize: "1.25rem", fontWeight: 600 }}>Loading dashboard...</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div style={{ padding: "2rem", color: "red" }}>
+        <h2>Error</h2>
+        <p>{error}</p>
+        <button onClick={() => window.location.reload()} style={{ marginTop: "1rem", padding: "0.5rem 1rem" }}>
+          Reload Page
+        </button>
+      </div>
+    );
+  }
 
    return (
      <div className="app-layout">
@@ -507,9 +568,9 @@ const Dashboard = () => {
                 <tbody>
                   {boardinghouses.map((bh) => {
                     const total = bh.rooms?.length ?? 0;
-                    const available = (bh.rooms ?? []).filter((r) => Number(r.availableBeds) > 0).length;
+                    const available = (bh.rooms ?? []).filter((r) => Number(r.bedsAvailable) > 0).length;
                     const anyCR = (bh.rooms ?? []).some((r) => r.withCR) ? "Yes" : "No";
-                    const anyCooking = (bh.rooms ?? []).some((r) => r.cookingAllowed) ? "Yes" : "No";
+                    const anyCooking = (bh.rooms ?? []).some((r) => r.cooking) ? "Yes" : "No";
                     return (
                       <tr key={bh.id}>
                         <td className="font-semibold text-blue-600">{bh.name}</td>
@@ -581,11 +642,11 @@ const Dashboard = () => {
                     <tr key={room.id}>
                       <td className="font-semibold">{room.roomName}</td>
                       <td>{room.boardinghouseName}</td>
-                      <td>{room.availableBeds}</td>
+                      <td>{room.bedsAvailable}</td>
                       <td>{room.gender}</td>
                       <td>
-                        <span className={`status-badge status-${room.availableBeds > 0 ? "active" : "full"}`}>
-                          {room.availableBeds > 0 ? "🟢 Active" : "⚪ Full"}
+                        <span className={`status-badge status-${room.bedsAvailable > 0 ? "active" : "full"}`}>
+                          {room.bedsAvailable > 0 ? "🟢 Active" : "⚪ Full"}
                         </span>
                       </td>
                     </tr>
@@ -615,25 +676,31 @@ const Dashboard = () => {
             >
               <p style={{ margin: 0, fontWeight: 600 }}>Rooms by Gender</p>
               <div style={{ width: "100%", height: 180, marginTop: 8 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart
-                    data={[
-                      { name: "Male", value: roomsByGenderCounts.male },
-                      { name: "Female", value: roomsByGenderCounts.female },
-                      { name: "Any/Other", value: roomsByGenderCounts.any },
-                    ]}
-                    margin={{ top: 8, right: 8, left: 8, bottom: 8 }}
-                  >
-                    <XAxis dataKey="name" tick={{ fontSize: 12 }} />
-                    <YAxis allowDecimals={false} tick={{ fontSize: 12 }} width={24} />
-                    <Tooltip formatter={(val: any) => [val, "Rooms"]} />
-                    <Bar dataKey="value" barSize={36} radius={[8, 8, 0, 0]}>
-                      <Cell fill="#3b82f6" />
-                      <Cell fill="#ec4899" />
-                      <Cell fill="#6b7280" />
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
+                {totalRooms > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart
+                      data={[
+                        { name: "Male", value: roomsByGenderCounts.male },
+                        { name: "Female", value: roomsByGenderCounts.female },
+                        { name: "Any/Other", value: roomsByGenderCounts.any },
+                      ]}
+                      margin={{ top: 8, right: 8, left: 8, bottom: 8 }}
+                    >
+                      <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                      <YAxis allowDecimals={false} tick={{ fontSize: 12 }} width={24} />
+                      <Tooltip formatter={(val: any) => [val, "Rooms"]} />
+                      <Bar dataKey="value" barSize={36} radius={[8, 8, 0, 0]}>
+                        <Cell fill="#3b82f6" />
+                        <Cell fill="#ec4899" />
+                        <Cell fill="#6b7280" />
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#9ca3af", fontSize: "0.875rem" }}>
+                    No room data
+                  </div>
+                )}
               </div>
             </div>
 
@@ -651,25 +718,31 @@ const Dashboard = () => {
             >
               <p style={{ margin: 0, fontWeight: 600 }}>Occupancy Rate</p>
               <div style={{ width: "100%", height: 150, marginTop: 8, position: "relative" }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={[
-                        { name: "Occupied", value: occupiedBeds },
-                        { name: "Available", value: Math.max(0, totalBeds - occupiedBeds) },
-                      ]}
-                      dataKey="value"
-                      startAngle={180}
-                      endAngle={0}
-                      innerRadius="65%"
-                      outerRadius="95%"
-                      stroke="none"
-                    >
-                      <Cell fill="#3b82f6" />
-                      <Cell fill="#e5e7eb" />
-                    </Pie>
-                  </PieChart>
-                </ResponsiveContainer>
+                {totalBeds > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={[
+                          { name: "Occupied", value: occupiedBeds },
+                          { name: "Available", value: Math.max(0, totalBeds - occupiedBeds) },
+                        ]}
+                        dataKey="value"
+                        startAngle={180}
+                        endAngle={0}
+                        innerRadius="65%"
+                        outerRadius="95%"
+                        stroke="none"
+                      >
+                        <Cell fill="#3b82f6" />
+                        <Cell fill="#e5e7eb" />
+                      </Pie>
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#9ca3af", fontSize: "0.875rem" }}>
+                    No bed data
+                  </div>
+                )}
                 <div
                   style={{
                     position: "absolute",
@@ -686,7 +759,7 @@ const Dashboard = () => {
                     {totalBeds > 0 ? `${occupancyPercent}%` : "—"}
                   </div>
                   <div style={{ fontSize: 12, color: "#6b7280" }}>
-                    {totalBeds > 0 ? `${occupiedBeds} of ${totalBeds} beds occupied` : "No bed data"}
+                    {totalBeds > 0 ? `${occupiedBeds} of ${totalBeds} beds occupied` : ""}
                   </div>
                 </div>
               </div>
@@ -716,26 +789,30 @@ const Dashboard = () => {
                   marginTop: 8,
                 }}
               >
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={[
-                        { name: "With CR", value: roomsWithCR },
-                        { name: "Without CR", value: Math.max(0, totalRooms - roomsWithCR) },
-                      ]}
-                      innerRadius={34}
-                      outerRadius={56}
-                      dataKey="value"
-                      startAngle={90}
-                      endAngle={-270}
-                      labelLine={false}
-                    >
-                      <Cell fill="#10b981" />
-                      <Cell fill="#e5e7eb" />
-                    </Pie>
-                    <Legend verticalAlign="bottom" height={24} />
-                  </PieChart>
-                </ResponsiveContainer>
+                {totalRooms > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={[
+                          { name: "With CR", value: roomsWithCR },
+                          { name: "Without CR", value: Math.max(0, totalRooms - roomsWithCR) },
+                        ]}
+                        innerRadius={34}
+                        outerRadius={56}
+                        dataKey="value"
+                        startAngle={90}
+                        endAngle={-270}
+                        labelLine={false}
+                      >
+                        <Cell fill="#10b981" />
+                        <Cell fill="#e5e7eb" />
+                      </Pie>
+                      <Legend verticalAlign="bottom" height={24} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ color: "#9ca3af", fontSize: "0.875rem" }}>No room data</div>
+                )}
               </div>
               <div style={{ marginTop: 6, textAlign: "center" }}>
                 <div style={{ fontSize: 20, fontWeight: 700 }}>{roomsWithCRPercent}%</div>
@@ -757,14 +834,20 @@ const Dashboard = () => {
             >
               <p style={{ margin: 0, fontWeight: 600 }}>Amenities Distribution</p>
               <div style={{ width: "100%", height: 220, marginTop: 8 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={amenityData} margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
-                    <XAxis dataKey="name" tick={{ fontSize: 12 }} />
-                    <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
-                    <Tooltip formatter={(val: any) => [val, "Rooms"]} />
-                    <Bar dataKey="count" fill="#3b82f6" radius={[6, 6, 0, 0]} barSize={24} />
-                  </BarChart>
-                </ResponsiveContainer>
+                {totalRooms > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={amenityData} margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                      <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                      <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
+                      <Tooltip formatter={(val: any) => [val, "Rooms"]} />
+                      <Bar dataKey="count" fill="#3b82f6" radius={[6, 6, 0, 0]} barSize={24} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#9ca3af", fontSize: "0.875rem" }}>
+                    No room data
+                  </div>
+                )}
               </div>
             </div>
 
@@ -780,14 +863,20 @@ const Dashboard = () => {
             >
               <p style={{ margin: 0, fontWeight: 600 }}>Price Range Distribution</p>
               <div style={{ width: "100%", height: 220, marginTop: 8 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={priceRangeData} margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
-                    <XAxis dataKey="name" tick={{ fontSize: 12 }} />
-                    <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
-                    <Tooltip formatter={(val: any) => [val, "Rooms"]} />
-                    <Bar dataKey="count" fill="#ec4899" radius={[6, 6, 0, 0]} barSize={24} />
-                  </BarChart>
-                </ResponsiveContainer>
+                {totalRooms > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={priceRangeData} margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                      <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                      <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
+                      <Tooltip formatter={(val: any) => [val, "Rooms"]} />
+                      <Bar dataKey="count" fill="#ec4899" radius={[6, 6, 0, 0]} barSize={24} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#9ca3af", fontSize: "0.875rem" }}>
+                    No room data
+                  </div>
+                )}
               </div>
             </div>
 
@@ -803,27 +892,33 @@ const Dashboard = () => {
             >
               <p style={{ margin: 0, fontWeight: 600 }}>Boardinghouse Performance Comparison</p>
               <div style={{ width: "100%", height: 260, marginTop: 8 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart
-                    data={performanceData}
-                    margin={{ top: 8, right: 12, left: 8, bottom: 48 }}
-                  >
-                    <XAxis
-                      dataKey="name"
-                      tick={{ fontSize: 12 }}
-                      angle={-20}
-                      textAnchor="end"
-                      interval={0}
-                      height={60}
-                    />
-                    <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
-                    <Tooltip />
-                    <Legend />
-                    <Bar dataKey="total" fill="#06b6d4" name="Total Rooms" barSize={16} />
-                    <Bar dataKey="available" fill="#10b981" name="Available Rooms" barSize={16} />
-                    <Bar dataKey="occupied" fill="#3b82f6" name="Occupied Rooms" barSize={16} />
-                  </BarChart>
-                </ResponsiveContainer>
+                {totalBoardinghouses > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart
+                      data={performanceData}
+                      margin={{ top: 8, right: 12, left: 8, bottom: 48 }}
+                    >
+                      <XAxis
+                        dataKey="name"
+                        tick={{ fontSize: 12 }}
+                        angle={-20}
+                        textAnchor="end"
+                        interval={0}
+                        height={60}
+                      />
+                      <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
+                      <Tooltip />
+                      <Legend />
+                      <Bar dataKey="total" fill="#06b6d4" name="Total Rooms" barSize={16} />
+                      <Bar dataKey="available" fill="#10b981" name="Available Rooms" barSize={16} />
+                      <Bar dataKey="occupied" fill="#3b82f6" name="Occupied Rooms" barSize={16} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#9ca3af", fontSize: "0.875rem" }}>
+                    No boardinghouse data
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -912,7 +1007,7 @@ const Dashboard = () => {
                         </div>
                         <div className="activity-content">
                           <p className="activity-text">{a.message}</p>
-                          <p className="activity-time">{new Date(a.ts).toLocaleString()}</p>
+                          <p className="activity-time">{!Number.isNaN(Number(a.ts)) ? new Date(a.ts).toLocaleString() : "Unknown date"}</p>
                         </div>
                       </div>
                     );

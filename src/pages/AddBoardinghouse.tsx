@@ -4,14 +4,15 @@ import { Sidebar } from "@/components/Sidebar";
 import "../styles/boardinghouse.css";
 import { useIsMobile } from "../hooks/use-mobile";
 import React, { useRef } from "react";
-import type { ChangeEvent } from "react";
-import type { Boardinghouse } from "../hooks/useBoardinghouseStorage";
-import { addBoardinghouse } from "../hooks/useBoardinghouseStorage";
 import { useToast } from "../hooks/use-toast";
 import regionData from "../ph-json/region.json";
 import provinceData from "../ph-json/province.json";
 import cityData from "../ph-json/city.json";
 import barangayData from "../ph-json/barangay.json";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "@/firebase/config";
+import { createBoardinghouse, getUserDoc, uploadPhoto } from "@/lib/firestore";
+import type { UserDoc } from "@/types/firestore";
 
 export default function AddBoardinghouse() {
   const isMobile = useIsMobile();
@@ -24,8 +25,11 @@ export default function AddBoardinghouse() {
   const [name, setName] = React.useState("");
   const [description, setDescription] = React.useState("");
   const [facebook, setFacebook] = React.useState("");
-  const [photos, setPhotos] = React.useState<string[]>([]);
+  const [photos, setPhotos] = React.useState<SelectedPhoto[]>([]);
   const [saving, setSaving] = React.useState(false);
+  const [ownerUid, setOwnerUid] = React.useState<string>("");
+  const [ownerProfile, setOwnerProfile] = React.useState<UserDoc | null>(null);
+  const [authChecking, setAuthChecking] = React.useState(true);
 
   // address structure + dropdown options
   type RegionItem = { region_code: string; region_name: string };
@@ -43,10 +47,27 @@ export default function AddBoardinghouse() {
     [k: string]: any;
   };
 
-  const regions: RegionItem[] = (regionData as any) ?? [];
-  const provincesAll: ProvinceItem[] = (provinceData as any) ?? [];
-  const citiesAll: CityItem[] = (cityData as any) ?? [];
-  const barangaysAll: BarangayItem[] = (barangayData as any) ?? [];
+  type SelectedPhoto = {
+    preview: string;
+    file: File;
+  };
+
+  const regions = React.useMemo<RegionItem[]>(
+    () => (Array.isArray(regionData) ? (regionData as RegionItem[]) : []),
+    []
+  );
+  const provincesAll = React.useMemo<ProvinceItem[]>(
+    () => (Array.isArray(provinceData) ? (provinceData as ProvinceItem[]) : []),
+    []
+  );
+  const citiesAll = React.useMemo<CityItem[]>(
+    () => (Array.isArray(cityData) ? (cityData as CityItem[]) : []),
+    []
+  );
+  const barangaysAll = React.useMemo<BarangayItem[]>(
+    () => (Array.isArray(barangayData) ? (barangayData as BarangayItem[]) : []),
+    []
+  );
 
   const [selectedRegion, setSelectedRegion] = React.useState<string>("");
   const [selectedProvince, setSelectedProvince] = React.useState<string>("");
@@ -57,28 +78,80 @@ export default function AddBoardinghouse() {
   const [cities, setCities] = React.useState<CityItem[]>([]);
   const [barangays, setBarangays] = React.useState<BarangayItem[]>([]);
 
-  const [street, setStreet] = React.useState<string>(""); // House No./Street Name
-  const [zipCode, setZipCode] = React.useState<string>("");
+  const [zipCode, setZipCode] = React.useState("");
+  const [street, setStreet] = React.useState("");
 
-  // detect keys used by barangay dataset (memoized)
-  const barangayCodeKey = React.useMemo(() => {
-    const sample = barangaysAll[0] ?? {};
-    if ("brgy_code" in sample) return "brgy_code";
-    if ("barangay_code" in sample) return "barangay_code";
-    if ("barangayCode" in sample) return "barangayCode";
-    if ("id" in sample) return "id";
-    return "brgy_code";
-  }, [barangaysAll]);
+  const getBarangayCode = React.useCallback((item: BarangayItem): string => {
+    const raw =
+      item.brgy_code ??
+      item.barangay_code ??
+      (item as Record<string, unknown>).brgyCode ??
+      (item as Record<string, unknown>).barangayCode ??
+      "";
+    return raw ? String(raw) : "";
+  }, []);
 
-  const barangayNameKey = React.useMemo(() => {
-    const sample = barangaysAll[0] ?? {};
-    if ("brgy_name" in sample) return "brgy_name";
-    if ("barangay_name" in sample) return "barangay_name";
-    if ("name" in sample) return "name";
-    return "brgy_name";
-  }, [barangaysAll]);
+  const getBarangayName = React.useCallback((item: BarangayItem): string => {
+    const raw =
+      item.brgy_name ??
+      item.barangay_name ??
+      (item as Record<string, unknown>).brgyName ??
+      (item as Record<string, unknown>).barangayName ??
+      (item as Record<string, unknown>).name ??
+      "";
+    return raw ? String(raw) : "";
+  }, []);
 
-  // region -> provinces
+  React.useEffect(() => {
+    let active = true;
+
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!active) return;
+
+      if (!firebaseUser) {
+        setOwnerUid("");
+        setOwnerProfile(null);
+        toast({ title: "Access denied", description: "Please sign in as an owner." });
+        setAuthChecking(false);
+        navigate("/auth");
+        return;
+      }
+
+      try {
+        const profile = await getUserDoc(firebaseUser.uid);
+        if (!active) return;
+
+        if (!profile || profile.role !== "owner") {
+          setOwnerUid("");
+          setOwnerProfile(null);
+          toast({ title: "Access denied", description: "Owners only page." });
+          setAuthChecking(false);
+          navigate("/interface");
+          return;
+        }
+
+        setOwnerUid(firebaseUser.uid);
+        setOwnerProfile(profile);
+        setOwnerName((prev) => (prev ? prev : profile.fullName ?? firebaseUser.displayName ?? ""));
+      } catch (error) {
+        console.error("Failed to verify owner profile", error);
+        setOwnerUid("");
+        setOwnerProfile(null);
+        toast({ title: "Authentication error", description: "Unable to load your profile." });
+        navigate("/auth");
+      } finally {
+        if (active) {
+          setAuthChecking(false);
+        }
+      }
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [navigate, toast]);
+
   React.useEffect(() => {
     if (!selectedRegion) {
       setProvinces([]);
@@ -89,7 +162,10 @@ export default function AddBoardinghouse() {
       setSelectedBarangay("");
       return;
     }
-    const filtered = provincesAll.filter((p) => String(p.region_code) === String(selectedRegion));
+
+    const filtered = provincesAll.filter(
+      (province) => String(province.region_code) === String(selectedRegion)
+    );
     setProvinces(filtered);
     setSelectedProvince("");
     setCities([]);
@@ -98,7 +174,6 @@ export default function AddBoardinghouse() {
     setSelectedBarangay("");
   }, [selectedRegion, provincesAll]);
 
-  // province -> cities
   React.useEffect(() => {
     if (!selectedProvince) {
       setCities([]);
@@ -107,41 +182,45 @@ export default function AddBoardinghouse() {
       setSelectedBarangay("");
       return;
     }
-    const filtered = citiesAll.filter((c) => String(c.province_code) === String(selectedProvince));
+
+    const filtered = citiesAll.filter(
+      (city) => String(city.province_code) === String(selectedProvince)
+    );
     setCities(filtered);
     setSelectedCity("");
     setBarangays([]);
     setSelectedBarangay("");
   }, [selectedProvince, citiesAll]);
 
-  // city -> barangays (use city_code match)
   React.useEffect(() => {
-    console.log("AddBH: selectedCity =", selectedCity);
     if (!selectedCity) {
       setBarangays([]);
       setSelectedBarangay("");
       return;
     }
 
-    // prefer explicit city_code field on barangays (your dataset uses city_code)
-    const filtered = barangaysAll.filter((b) => {
-      // primary: match b.city_code
-      if (b.city_code != null && String(b.city_code) === String(selectedCity)) return true;
-      // fallback: try mun_code, citymunCode etc.
-      if (b.mun_code != null && String(b.mun_code) === String(selectedCity)) return true;
-      if ((b as any).citymunCode != null && String((b as any).citymunCode) === String(selectedCity)) return true;
-      if ((b as any).citymun_code != null && String((b as any).citymun_code) === String(selectedCity)) return true;
-      // last resort: check any property equal to selectedCity
-      return Object.values(b).some((v) => String(v) === String(selectedCity));
-    });
+    const filtered = barangaysAll.filter((barangay) => {
+      const codes = [
+        barangay.city_code,
+        barangay.mun_code,
+        (barangay as Record<string, unknown>).citymunCode,
+        (barangay as Record<string, unknown>).citymun_code,
+      ]
+        .filter((value) => value != null)
+        .map((value) => String(value));
 
-    console.log("AddBH: barangay dataset sample keys:", barangaysAll[0] ? Object.keys(barangaysAll[0]).slice(0, 8) : "empty");
-    console.log("AddBH: detected barangay code key:", barangayCodeKey, "name key:", barangayNameKey);
-    console.log(`AddBH: filtered barangays for city ${selectedCity} => ${filtered.length} items`);
+      if (codes.length === 0) {
+        return Object.values(barangay).some(
+          (value) => value != null && String(value) === String(selectedCity)
+        );
+      }
+
+      return codes.some((value) => value === String(selectedCity));
+    });
 
     setBarangays(filtered);
     setSelectedBarangay("");
-  }, [selectedCity, barangaysAll, barangayCodeKey, barangayNameKey]);
+  }, [selectedCity, barangaysAll]);
 
   const validate = (): boolean => {
     if (!name.trim()) {
@@ -151,95 +230,66 @@ export default function AddBoardinghouse() {
     return true;
   };
 
+  const makeBoardinghouseId = () =>
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
   const handleSave = async () => {
     if (!validate()) return;
+    if (!ownerUid) {
+      toast({ title: "Authentication", description: "Please sign in as an owner." });
+      return;
+    }
+
     setSaving(true);
     try {
-      // resolve display names from selected codes (always attempt to derive the full names)
       const regionName = regions.find((r) => String(r.region_code) === String(selectedRegion))?.region_name ?? "";
       const provinceName = provinces.find((p) => String(p.province_code) === String(selectedProvince))?.province_name ?? "";
       const cityName = cities.find((c) => String(c.city_code) === String(selectedCity))?.city_name ?? "";
-      const barangayObj = barangays.find((b) => {
-        const code = String((b as any)[barangayCodeKey] ?? (b as any).brgy_code ?? (b as any).barangay_code ?? "");
-        return code && String(code) === String(selectedBarangay);
+      const barangayObj = barangays.find((barangay) => {
+        const code = getBarangayCode(barangay);
+        return code && code === String(selectedBarangay);
       });
-      const barangayName = barangayObj
-        ? String((barangayObj as any)[barangayNameKey] ?? (barangayObj as any).brgy_name ?? (barangayObj as any).barangay_name ?? "")
-        : "";
+      const barangayName = barangayObj ? getBarangayName(barangayObj) : "";
 
-      // ensure structuredAddress always contains the chosen values (names + codes + street/zip)
-      const structuredAddress = {
-        region: regionName,
-        region_code: selectedRegion,
-        province: provinceName,
-        province_code: selectedProvince,
-        city: cityName,
-        city_code: selectedCity,
-        barangay: barangayName,
-        barangay_code: selectedBarangay,
-        street: street?.trim() ?? "",
-        zip: zipCode?.trim() ?? "",
-      };
+      const boardinghouseId = makeBoardinghouseId();
+      const uploadBasePath = `owners/${ownerUid}/boardinghouses/${boardinghouseId}`;
+      const photoUrls: string[] = [];
+      for (const photo of photos) {
+        const url = await uploadPhoto(photo.file, uploadBasePath);
+        photoUrls.push(url);
+      }
 
-      // compose full address string from all available parts (falls back to whatever the user entered)
-      const fullAddressParts = [
-        street?.trim(),
-        barangayName || undefined,
-        cityName || undefined,
-        provinceName || undefined,
-        regionName || undefined,
-      ].filter(Boolean);
-      const fullAddressString = fullAddressParts.join(", ");
-
-      // local extended type to allow structuredAddress field without modifying shared type
-      type StructuredAddress = {
-        region?: string;
-        region_code?: string;
-        province?: string;
-        province_code?: string;
-        city?: string;
-        city_code?: string;
-        barangay?: string;
-        barangay_code?: string;
-        street?: string;
-        zip?: string;
-        [k: string]: any;
-      };
-
-      type BoardinghouseExtended = Boardinghouse & {
-        structuredAddress?: StructuredAddress;
-        ownerEmail?: string;
-        ownerName?: string;
-        contact?: string;
-        facebook?: string;
-        photos?: string[];
-        rooms?: any[];
-      };
-
-      const newBH: BoardinghouseExtended = {
-        id: "", // hook will generate if empty
-        // ensure the boardinghouse is saved under the current owner's email
-        ownerEmail: ((): string => {
-          try {
-            const cu = JSON.parse(localStorage.getItem("currentUser") ?? "null") as { email?: string } | null;
-            return cu?.email ?? "";
-          } catch {
-            return "";
-          }
-        })(),
-        ownerName: ownerName.trim(),
+      await createBoardinghouse(ownerUid, {
+        id: boardinghouseId,
         name: name.trim(),
-        contact: contact.trim(),
-        address: fullAddressString, // legacy string field kept (now always filled when possible)
-        structuredAddress, // NEW structured address object (always included)
+        region: regionName,
+        regionCode: selectedRegion || undefined,
+        province: provinceName,
+        provinceCode: selectedProvince || undefined,
+        city: cityName,
+        cityCode: selectedCity || undefined,
+        barangay: barangayName,
+        barangayCode: selectedBarangay || undefined,
+        street: street?.trim() ?? "",
+        zipcode: zipCode?.trim() ?? "",
         description: description.trim(),
+        photos: photoUrls,
+        ownerName: ownerName.trim() || ownerProfile?.fullName || "",
+        contact: contact.trim(),
         facebook: facebook.trim(),
-        photos: photos,
-        rooms: [],
-      };
+        totalRooms: 0,
+      });
 
-      // cast to Boardinghouse to satisfy addBoardinghouse signature without changing shared types
-      addBoardinghouse(newBH as unknown as Boardinghouse);
+      photos.forEach((photo) => URL.revokeObjectURL(photo.preview));
+      setPhotos([]);
+
+      try {
+        localStorage.setItem("selectedBoardinghouseId", boardinghouseId);
+      } catch {
+        // ignore storage failures
+      }
 
       toast({ title: "Saved", description: "Boardinghouse added successfully." });
       navigate("/my-boardinghouse");
@@ -252,28 +302,28 @@ export default function AddBoardinghouse() {
   };
 
   const UploadPhotosSection: React.FC<{
-    photos: (string | File)[];
-    setPhotos: React.Dispatch<React.SetStateAction<(string | File)[]>>;
+    photos: SelectedPhoto[];
+    setPhotos: React.Dispatch<React.SetStateAction<SelectedPhoto[]>>;
   }> = ({ photos, setPhotos }) => {
     const fileInputRef = useRef<HTMLInputElement | null>(null);
 
     const onFilesSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(e.target.files || []);
       if (files.length === 0) return;
-      const urls = files.map((f) => {
-        const url = URL.createObjectURL(f);
-        return url;
-      });
-      setPhotos((prev) => [...prev, ...urls]);
+      const next = files.map((file) => ({
+        file,
+        preview: URL.createObjectURL(file),
+      }));
+      setPhotos((prev) => [...prev, ...next]);
       e.currentTarget.value = "";
     };
 
     const removePhoto = (index: number) => {
       setPhotos((prev) => {
         const copy = [...prev];
-        const removed = copy.splice(index, 1)[0];
-        if (typeof removed === "string" && removed.startsWith("blob:")) {
-          URL.revokeObjectURL(removed);
+        const [removed] = copy.splice(index, 1);
+        if (removed) {
+          URL.revokeObjectURL(removed.preview);
         }
         return copy;
       });
@@ -296,7 +346,7 @@ export default function AddBoardinghouse() {
           className="grid gap-4"
           style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}
         >
-          {photos.map((p, i) => (
+          {photos.map((photo, i) => (
             <div
               key={i}
               className="relative rounded-lg shadow-sm overflow-hidden bg-gray-100"
@@ -332,21 +382,12 @@ export default function AddBoardinghouse() {
                 ✖
               </button>
 
-              {typeof p === "string" ? (
-                <img
-                  src={p}
-                  alt={`photo-${i}`}
-                  className="w-full h-36 object-cover"
-                  style={{ maxWidth: "100%" }}
-                />
-              ) : (
-                <img
-                  src={URL.createObjectURL(p)}
-                  alt={`photo-${i}`}
-                  className="w-full h-36 object-cover"
-                  style={{ maxWidth: "100%" }}
-                />
-              )}
+              <img
+                src={photo.preview}
+                alt={`photo-${i}`}
+                className="w-full h-36 object-cover"
+                style={{ maxWidth: "100%" }}
+              />
             </div>
           ))}
 
@@ -501,8 +542,8 @@ export default function AddBoardinghouse() {
               >
                 <option value="">Select Barangay</option>
                 {barangays.map((b) => {
-                  const val = String((b as any)[barangayCodeKey] ?? (b as any).brgy_code ?? (b as any).barangay_code ?? "");
-                  const label = String((b as any)[barangayNameKey] ?? (b as any).brgy_name ?? (b as any).barangay_name ?? "");
+                  const val = getBarangayCode(b);
+                  const label = getBarangayName(b);
                   return (
                     <option key={val || label} value={val}>
                       {label}
@@ -540,7 +581,7 @@ export default function AddBoardinghouse() {
             <button
               onClick={handleSave}
               className="btn-save-listing"
-              disabled={saving}
+              disabled={saving || authChecking}
             >
               {saving ? "Saving..." : "Save Boardinghouse"}
             </button>

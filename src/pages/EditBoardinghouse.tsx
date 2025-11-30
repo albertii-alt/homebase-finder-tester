@@ -9,8 +9,8 @@ import regionData from "../ph-json/region.json";
 import provinceData from "../ph-json/province.json";
 import cityData from "../ph-json/city.json";
 import barangayData from "../ph-json/barangay.json";
-import type { Boardinghouse } from "../hooks/useBoardinghouseStorage";
-import { updateBoardinghouse } from "../hooks/useBoardinghouseStorage";
+import { getBoardinghouseById, updateBoardinghouse, uploadPhoto } from "@/lib/firestore";
+import type { BoardinghouseWithRooms } from "@/types/firestore";
 
 export default function EditBoardinghouse() {
   const isMobile = useIsMobile();
@@ -22,14 +22,14 @@ export default function EditBoardinghouse() {
   const [saving, setSaving] = React.useState(false);
   const [selectedId, setSelectedId] = React.useState<string>("");
 
-  const [bh, setBh] = React.useState<Boardinghouse | null>(null);
+  const [bh, setBh] = React.useState<BoardinghouseWithRooms | null>(null);
 
   // form fields
   const [name, setName] = React.useState("");
   const [description, setDescription] = React.useState("");
   const [facebook, setFacebook] = React.useState("");
   const [contact, setContact] = React.useState("");
-  const [photos, setPhotos] = React.useState<string[]>([]);
+  const [photos, setPhotos] = React.useState<(string | File)[]>([]);
   const [ownerName, setOwnerName] = React.useState<string>("");
 
   // address types
@@ -83,31 +83,28 @@ export default function EditBoardinghouse() {
     return "brgy_name";
   }, [barangaysAll]);
 
-  // load boardinghouse by id from localStorage on mount (or when params.id changes)
+  // load boardinghouse by id from Firestore on mount (or when params.id changes)
   React.useEffect(() => {
     const id = params.id ?? "";
     setSelectedId(id);
-    try {
-      const raw = localStorage.getItem("boardinghouses");
-      if (!raw) {
-        setBh(null);
-        setLoading(false);
-        return;
-      }
-      const list = JSON.parse(raw) as Boardinghouse[] | null;
-      if (!Array.isArray(list)) {
-        setBh(null);
-        setLoading(false);
-        return;
-      }
-      const found = list.find((b) => String(b.id) === String(id)) ?? null;
-      setBh(found);
-      setLoading(false);
-    } catch (err) {
-      console.warn("Failed to load boardinghouses from localStorage", err);
+    if (!id) {
       setBh(null);
       setLoading(false);
+      return;
     }
+
+    const fetchBh = async () => {
+      try {
+        const found = await getBoardinghouseById(id);
+        setBh(found);
+      } catch (err) {
+        console.warn("Failed to load boardinghouse from Firestore", err);
+        setBh(null);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchBh();
   }, [params.id]);
 
   // prefill form when bh is loaded
@@ -120,42 +117,34 @@ export default function EditBoardinghouse() {
     setFacebook(bh.facebook ?? "");
     setPhotos(bh.photos ?? []);
 
-    // if structuredAddress exists, prefill selects and text fields
-    const sa: any = (bh as any).structuredAddress ?? null;
-    if (sa) {
-      if (sa.region_code) {
-        setSelectedRegion(String(sa.region_code));
-        // populate provinces for this region so the previously saved province remains available
-        const provs = provincesAll.filter((p) => String(p.region_code) === String(sa.region_code));
-        setProvinces(provs);
-      }
-      if (sa.province_code) {
-        setSelectedProvince(String(sa.province_code));
-        // populate cities for this province so the previously saved city remains available
-        const cs = citiesAll.filter((c) => String(c.province_code) === String(sa.province_code));
-        setCities(cs);
-      }
-      if (sa.city_code) {
-        setSelectedCity(String(sa.city_code));
-        // populate barangays for this city so the previously saved barangay remains available
-        const brgs = barangaysAll.filter((b) => {
-          if ((b as any).city_code != null && String((b as any).city_code) === String(sa.city_code)) return true;
-          if ((b as any).mun_code != null && String((b as any).mun_code) === String(sa.city_code)) return true;
-          if ((b as any).citymunCode != null && String((b as any).citymunCode) === String(sa.city_code)) return true;
-          if ((b as any).citymun_code != null && String((b as any).citymun_code) === String(sa.city_code)) return true;
-          return Object.values(b).some((v) => typeof v !== "object" && String(v) === String(sa.city_code));
-        });
-        setBarangays(brgs);
-      }
-      // barangay code may be stored under few possible keys
-      const saBrgyCode = sa.barangay_code ?? sa.brgy_code ?? sa.brgyCode ?? sa.barangayCode;
-      if (saBrgyCode) setSelectedBarangay(String(saBrgyCode));
-      setStreet(sa.street ?? "");
-      setZipCode(sa.zip ?? "");
-    } else {
-      // best-effort: parse legacy address string into street
-      setStreet(bh.address ?? "");
+    // if structuredAddress exists (not in Firestore type yet, but we can infer from fields), prefill selects and text fields
+    // The Firestore type has flat fields: regionCode, provinceCode, etc.
+    if (bh.regionCode) {
+      setSelectedRegion(String(bh.regionCode));
+      const provs = provincesAll.filter((p) => String(p.region_code) === String(bh.regionCode));
+      setProvinces(provs);
     }
+    if (bh.provinceCode) {
+      setSelectedProvince(String(bh.provinceCode));
+      const cs = citiesAll.filter((c) => String(c.province_code) === String(bh.provinceCode));
+      setCities(cs);
+    }
+    if (bh.cityCode) {
+      setSelectedCity(String(bh.cityCode));
+      const brgs = barangaysAll.filter((b) => {
+        if ((b as any).city_code != null && String((b as any).city_code) === String(bh.cityCode)) return true;
+        if ((b as any).mun_code != null && String((b as any).mun_code) === String(bh.cityCode)) return true;
+        if ((b as any).citymunCode != null && String((b as any).citymunCode) === String(bh.cityCode)) return true;
+        if ((b as any).citymun_code != null && String((b as any).citymun_code) === String(bh.cityCode)) return true;
+        return Object.values(b).some((v) => typeof v !== "object" && String(v) === String(bh.cityCode));
+      });
+      setBarangays(brgs);
+    }
+    if (bh.barangayCode) {
+      setSelectedBarangay(String(bh.barangayCode));
+    }
+    setStreet(bh.street ?? "");
+    setZipCode(bh.zipcode ?? "");
   }, [bh, provincesAll, citiesAll, barangaysAll]);
 
   // cascading effects: region -> provinces
@@ -266,37 +255,51 @@ export default function EditBoardinghouse() {
         return code && String(code) === String(selectedBarangay);
       });
 
-      const updated = {
-        ...bh,
+      // Upload any new photos (File objects)
+      const finalPhotos: string[] = [];
+      // We need ownerId to build the path. If bh.ownerId is missing, we might have a problem, 
+      // but it should be there from Firestore.
+      const ownerId = bh.ownerId; 
+      const uploadBasePath = `owners/${ownerId}/boardinghouses/${bh.id}`;
+
+      for (const p of photos) {
+        if (typeof p === "string") {
+          finalPhotos.push(p);
+        } else {
+          // It's a File
+          const url = await uploadPhoto(p, uploadBasePath);
+          finalPhotos.push(url);
+        }
+      }
+
+      await updateBoardinghouse(bh.id, {
         ownerName: ownerName.trim(),
         contact: contact.trim(),
         name: name.trim(),
         description: description.trim(),
         facebook: facebook.trim(),
-        photos,
-        structuredAddress: {
-          region_code: selectedRegion,
-          region_name: region?.region_name ?? "",
-          province_code: selectedProvince,
-          province_name: province?.province_name ?? "",
-          city_code: selectedCity,
-          city_name: city?.city_name ?? "",
-          barangay_code: String((barangayObj as any)?.[barangayCodeKey] ?? (barangayObj as any)?.brgy_code ?? (barangayObj as any)?.barangay_code ?? ""),
-          barangay_name: String((barangayObj as any)?.[barangayNameKey] ?? (barangayObj as any)?.brgy_name ?? (barangayObj as any)?.barangay_name ?? ""),
-          street: street.trim(),
-          zip: zipCode.trim(),
-        },
-        address: [street, (barangayObj as any)?.[barangayNameKey] ?? "", city?.city_name ?? "", province?.province_name ?? "", region?.region_name ?? ""].filter(Boolean).join(", "),
-      } as unknown as Boardinghouse;
-
-      const ok = updateBoardinghouse(updated);
-      if (!ok) {
-        toast({ title: "Update failed", description: "Failed to update boardinghouse." });
-        setSaving(false);
-        return;
-      }
+        photos: finalPhotos,
+        region: region?.region_name ?? "",
+        regionCode: selectedRegion,
+        province: province?.province_name ?? "",
+        provinceCode: selectedProvince,
+        city: city?.city_name ?? "",
+        cityCode: selectedCity,
+        barangay: String((barangayObj as any)?.[barangayNameKey] ?? (barangayObj as any)?.brgy_name ?? (barangayObj as any)?.barangay_name ?? ""),
+        barangayCode: String((barangayObj as any)?.[barangayCodeKey] ?? (barangayObj as any)?.brgy_code ?? (barangayObj as any)?.barangay_code ?? ""),
+        street: street.trim(),
+        zipcode: zipCode.trim(),
+      });
 
       toast({ title: "Updated", description: "Boardinghouse updated successfully." });
+      
+      // Revoke object URLs for uploaded files
+      photos.forEach(p => {
+        if (typeof p !== "string" && (p as any).preview) {
+           URL.revokeObjectURL((p as any).preview);
+        }
+      });
+
       setTimeout(() => {
         navigate("/my-boardinghouse");
       }, 600);

@@ -6,7 +6,8 @@ import { Sidebar } from "@/components/Sidebar";
 import { useIsMobile } from "../hooks/use-mobile";
 import "../styles/boardinghouse.css";
 import { useToast } from "../hooks/use-toast";
-import { getBoardinghousesByOwner, deleteRoom } from "../hooks/useBoardinghouseStorage";
+import { getBoardinghouseById, deleteRoom } from "@/lib/firestore";
+import type { BoardinghouseWithRooms, RoomDoc } from "@/types/firestore";
 
 export default function AddedRooms(): JSX.Element {
   const isMobile = useIsMobile();
@@ -33,11 +34,11 @@ export default function AddedRooms(): JSX.Element {
     }
   });
 
-  const [boardinghouse, setBoardinghouse] = React.useState<any | null>(null);
-  const [rooms, setRooms] = React.useState<any[]>([]);
+  const [boardinghouse, setBoardinghouse] = React.useState<BoardinghouseWithRooms | null>(null);
+  const [rooms, setRooms] = React.useState<RoomDoc[]>([]);
   const [loading, setLoading] = React.useState(true);
 
-  const load = React.useCallback(() => {
+  const load = React.useCallback(async () => {
     setLoading(true);
     try {
       if (!ownerEmail) {
@@ -45,21 +46,28 @@ export default function AddedRooms(): JSX.Element {
         setRooms([]);
         return;
       }
-      const list = getBoardinghousesByOwner(ownerEmail);
-      let bh = null;
-      if (selectedBhId) {
-        bh = list.find((b) => String(b.id) === String(selectedBhId)) ?? null;
+      
+      if (!selectedBhId) {
+         // If no ID selected, we can't load anything.
+         // In the old code it tried to find the first one.
+         // We can't easily do that without fetching all.
+         // For now, just return empty.
+         setBoardinghouse(null);
+         setRooms([]);
+         return;
       }
-      // if selected not found, fall back to first owned boardinghouse
-      if (!bh && list.length > 0) {
-        bh = list[0];
-        try {
-          localStorage.setItem("selectedBoardinghouseId", bh.id);
-          setSelectedBhId(bh.id);
-        } catch {}
+
+      const bh = await getBoardinghouseById(selectedBhId);
+      if (!bh) {
+        setBoardinghouse(null);
+        setRooms([]);
+        return;
       }
+      
       setBoardinghouse(bh);
-      setRooms((bh?.rooms ?? []) as any[]);
+      setRooms(bh.rooms ?? []);
+    } catch (err) {
+      console.error(err);
     } finally {
       setLoading(false);
     }
@@ -92,16 +100,16 @@ export default function AddedRooms(): JSX.Element {
     navigate("/edit-room", { state: { from: `/added-rooms` } });
   };
 
-  const handleDeleteRoom = (roomId: string) => {
+  const handleDeleteRoom = async (roomId: string) => {
     if (!boardinghouse) return;
-    const ok = deleteRoom(boardinghouse.id, roomId);
-    if (!ok) {
+    try {
+      await deleteRoom(boardinghouse.id, roomId);
+      toast({ title: "Deleted", description: "Room removed." });
+      load();
+    } catch (err) {
+      console.error(err);
       toast({ title: "Delete failed", description: "Failed to delete room." });
-      return;
     }
-    toast({ title: "Deleted", description: "Room removed." });
-    // reload local copy
-    load();
   };
 
   if (loading) {

@@ -4,73 +4,19 @@ import { useIsMobile } from "../hooks/use-mobile";
 import { useToast } from "../hooks/use-toast";
 import { User, Trash2, Camera, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-
-type CurrentUser = {
-  name?: string;
-  email?: string;
-  role?: string;
-  avatar?: string;
-};
-
-function readCurrentUser(): CurrentUser | null {
-  try {
-    const raw = localStorage.getItem("currentUser");
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveCurrentUser(u: CurrentUser | null) {
-  if (!u) {
-    localStorage.removeItem("currentUser");
-  } else {
-    localStorage.setItem("currentUser", JSON.stringify(u));
-  }
-}
-
-// === NEW helpers for persistent user store and image handling ===
-function readUsers(): CurrentUser[] {
-  try {
-    const raw = localStorage.getItem("users");
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-function writeUsers(users: CurrentUser[]) {
-  try {
-    localStorage.setItem("users", JSON.stringify(users));
-  } catch {
-    // ignore
-  }
-}
-function upsertUser(user: CurrentUser) {
-  if (!user || !user.email) return;
-  const users = readUsers();
-  const idx = users.findIndex((u) => String(u.email).toLowerCase() === String(user.email).toLowerCase());
-  if (idx === -1) {
-    users.push(user);
-  } else {
-    users[idx] = { ...users[idx], ...user };
-  }
-  writeUsers(users);
-}
-// convert File -> data URL so avatar survives across reloads/logins
-function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(String(fr.result));
-    fr.onerror = reject;
-    fr.readAsDataURL(file);
-  });
-}
+import { onAuthStateChanged, deleteUser, signOut } from "firebase/auth";
+import { auth, db, storage } from "@/firebase/config";
+import { doc, updateDoc, deleteDoc, collection, query, where, getDocs } from "firebase/firestore";
+import { ref, uploadString, getDownloadURL } from "firebase/storage";
+import { getUserDoc, deleteBoardinghouse } from "@/lib/firestore";
+import type { UserDoc } from "@/types/firestore";
 
 const DeleteAccountModal: React.FC<{
   open: boolean;
   onClose: () => void;
   onConfirm: () => void;
-}> = ({ open, onClose, onConfirm }) => {
+  deleting: boolean;
+}> = ({ open, onClose, onConfirm, deleting }) => {
   if (!open) return null;
   return (
     <div
@@ -104,6 +50,7 @@ const DeleteAccountModal: React.FC<{
         <button
           aria-label="Close"
           onClick={onClose}
+          disabled={deleting}
           style={{
             position: "absolute",
             right: 12,
@@ -127,6 +74,7 @@ const DeleteAccountModal: React.FC<{
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 20 }}>
           <button
             onClick={onClose}
+            disabled={deleting}
             style={{
               padding: "8px 16px",
               borderRadius: 999,
@@ -140,6 +88,7 @@ const DeleteAccountModal: React.FC<{
           </button>
           <button
             onClick={onConfirm}
+            disabled={deleting}
             style={{
               padding: "8px 16px",
               borderRadius: 999,
@@ -148,9 +97,10 @@ const DeleteAccountModal: React.FC<{
               color: "white",
               cursor: "pointer",
               boxShadow: "0 6px 18px rgba(220,38,38,0.24)",
+              opacity: deleting ? 0.7 : 1,
             }}
           >
-            Yes, Delete It
+            {deleting ? "Deleting..." : "Yes, Delete It"}
           </button>
         </div>
       </div>
@@ -164,58 +114,55 @@ export default function AccountSettings(): JSX.Element {
   const { toast } = useToast();
   
   const [activeTab, setActiveTab] = React.useState<"profile" | "delete">("profile");
-  const [user, setUser] = React.useState<CurrentUser>(() => readCurrentUser() ?? { name: "User", email: "", role: "owner", avatar: "" });
+  const [user, setUser] = React.useState<UserDoc | null>(null);
+  const [loading, setLoading] = React.useState(true);
 
-  const [name, setName] = React.useState(user.name ?? "");
-  const [email] = React.useState(user.email ?? "");
-  const [avatarUrl, setAvatarUrl] = React.useState(
-    user.avatar ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(user.name ?? "User")}`
-  );
+  const [name, setName] = React.useState("");
+  const [email, setEmail] = React.useState("");
+  const [avatarUrl, setAvatarUrl] = React.useState("");
 
   const [deleteModalOpen, setDeleteModalOpen] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
 
   React.useEffect(() => {
-    const cur = readCurrentUser();
-    if (cur) {
-      setUser(cur);
-      setName(cur.name ?? "");
-      setAvatarUrl(cur.avatar ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(cur.name ?? "User")}`);
-    }
-  }, []);
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        try {
+          const profile = await getUserDoc(firebaseUser.uid);
+          if (profile) {
+            setUser(profile);
+            setName(profile.fullName);
+            setEmail(profile.email);
+            // Use a placeholder if no avatar (Firestore user doc doesn't have avatar field in types yet, but we can add it or use a separate storage path)
+            // For now, we'll use the dicebear one based on name
+            setAvatarUrl(`https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(profile.fullName)}`);
+          }
+        } catch (err) {
+          console.error("Failed to load user profile", err);
+        }
+      } else {
+        navigate("/auth");
+      }
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, [navigate]);
 
-  // Save handler: persist to localStorage, show toast and redirect to Interface
+  // Save handler: persist to Firestore
   const handleSave = async () => {
-    // ensure we keep email (cannot change email here)
-    const updated: CurrentUser = {
-      ...user,
-      name: name.trim(),
-      avatar: avatarUrl,
-    };
-
+    if (!user) return;
+    
     try {
-      // persist current user (active session)
-      saveCurrentUser(updated);
+      const userRef = doc(db, "users", user.uid);
+      await updateDoc(userRef, {
+        fullName: name.trim(),
+      });
 
-      // also persist in central users store so re-login picks up changes
-      // (if user.email missing, we only update currentUser)
-      if (updated.email) {
-        upsertUser(updated);
-      }
+      // Update local state
+      setUser({ ...user, fullName: name.trim() });
+      setAvatarUrl(`https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(name.trim())}`);
 
-      // notify other tabs/windows
-      try {
-        localStorage.setItem("currentUser_last_update", String(Date.now()));
-      } catch {
-        // ignore
-      }
-
-      // show toast (use provided toast helper)
       toast({ title: "Saved", description: "Account details updated." });
-
-      // short delay so user sees toast, then redirect to interface
-      setTimeout(() => {
-        navigate("/interface");
-      }, 500);
     } catch (err) {
       console.error("Failed to save account settings", err);
       toast({ title: "Error", description: "Failed to save account details." });
@@ -223,72 +170,51 @@ export default function AccountSettings(): JSX.Element {
   };
 
   const handleUploadAvatar = async (file?: File) => {
-    if (!file) return;
+    if (!file || !user) return;
+    // For now, we just update the local preview as we don't have an avatar field in UserDoc yet
+    // In a real app, we would upload to Storage and update the user doc
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      if (e.target?.result) {
+        setAvatarUrl(e.target.result as string);
+      }
+    };
+    reader.readAsDataURL(file);
+    toast({ title: "Note", description: "Avatar upload is not fully implemented in backend yet." });
+  };
+
+  const handleDeleteAccount = async () => {
+    if (!user || !auth.currentUser) return;
+    setDeleting(true);
+
     try {
-      const dataUrl = await fileToDataUrl(file);
-      // save in component state (data URL persists)
-      setAvatarUrl(dataUrl);
+      // 1. Delete all boardinghouses owned by this user
+      const q = query(collection(db, "boardinghouses"), where("ownerId", "==", user.uid));
+      const snapshot = await getDocs(q);
+      
+      const deletePromises = snapshot.docs.map(doc => deleteBoardinghouse(doc.id));
+      await Promise.all(deletePromises);
+
+      // 2. Delete user document
+      await deleteDoc(doc(db, "users", user.uid));
+
+      // 3. Delete Firebase Auth user
+      await deleteUser(auth.currentUser);
+
+      // 4. Clear local storage just in case
+      localStorage.clear();
+
+      toast({ title: "Account deleted", description: "Your account and listings have been removed." });
+      navigate("/auth");
     } catch (err) {
-      console.error("Failed to read avatar", err);
-      toast({ title: "Error", description: "Failed to read image file." });
+      console.error("Failed to delete account", err);
+      toast({ title: "Error", description: "Failed to delete account. You may need to re-login." });
+      setDeleting(false);
+      setDeleteModalOpen(false);
     }
   };
 
-  const handleDeleteAccount = () => {
-    const cu = readCurrentUser();
-    const ownerEmail = cu?.email ?? "";
-
-    // 1) Remove boardinghouses owned by this user
-    try {
-      const raw = localStorage.getItem("boardinghouses");
-      if (raw) {
-        const list = JSON.parse(raw) as any[];
-        const remaining = list.filter((b) => String(b.ownerEmail ?? "").toLowerCase() !== String(ownerEmail).toLowerCase());
-        localStorage.setItem("boardinghouses", JSON.stringify(remaining));
-      }
-    } catch (err) {
-      console.error("Failed to remove boardinghouses for deleted account", err);
-    }
-
-    // 2) Remove profile entry from "users" store
-    if (ownerEmail) {
-      try {
-        const users = readUsers().filter((u) => String(u.email ?? "").toLowerCase() !== String(ownerEmail).toLowerCase());
-        writeUsers(users);
-      } catch (err) {
-        console.error("Failed to remove user from users store", err);
-      }
-
-      // 3) Remove credential from registeredUsers so login is prevented
-      try {
-        const regRaw = localStorage.getItem("registeredUsers");
-        if (regRaw) {
-          const regs = JSON.parse(regRaw) as any[];
-          const remainingRegs = regs.filter((r) => String(r.email ?? "").toLowerCase() !== String(ownerEmail).toLowerCase());
-          localStorage.setItem("registeredUsers", JSON.stringify(remainingRegs));
-        }
-      } catch (err) {
-        console.error("Failed to remove credential from registeredUsers", err);
-      }
-    }
-
-    // 4) Clear session and notify other tabs
-    saveCurrentUser(null);
-    try {
-      localStorage.setItem("currentUser_last_update", String(Date.now()));
-    } catch {}
-
-    // 5) Optionally remove remembered email
-    try {
-      const remembered = localStorage.getItem("rememberedEmail");
-      if (remembered && (remembered ?? "").toLowerCase() === ownerEmail.toLowerCase()) {
-        localStorage.removeItem("rememberedEmail");
-      }
-    } catch {}
-
-    toast({ title: "Account deleted", description: "Your account and listings have been removed." });
-    navigate("/auth");
-  };
+  if (loading) return <div className="p-8">Loading settings...</div>;
 
   return (
     <div className="app-layout">
@@ -415,9 +341,9 @@ export default function AccountSettings(): JSX.Element {
                     </div>
 
                     <div>
-                      <div style={{ fontSize: 20, fontWeight: 700 }}>{user.name ?? "User"}</div>
+                      <div style={{ fontSize: 20, fontWeight: 700 }}>{user?.fullName ?? "User"}</div>
                       <div style={{ color: "#6b7280", marginTop: 4 }}>
-                        {user.role ? `${user.role.charAt(0).toUpperCase() + user.role.slice(1)} Account` : "Owner Account"}
+                        {user?.role ? `${user.role.charAt(0).toUpperCase() + user.role.slice(1)} Account` : "Owner Account"}
                       </div>
                     </div>
                   </div>
@@ -494,7 +420,12 @@ export default function AccountSettings(): JSX.Element {
           </div>
         </div>
 
-        <DeleteAccountModal open={deleteModalOpen} onClose={() => setDeleteModalOpen(false)} onConfirm={handleDeleteAccount} />
+        <DeleteAccountModal 
+          open={deleteModalOpen} 
+          onClose={() => setDeleteModalOpen(false)} 
+          onConfirm={handleDeleteAccount} 
+          deleting={deleting}
+        />
       </div>
     </div>
   );

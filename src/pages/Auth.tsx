@@ -1,22 +1,28 @@
-import { useState, useEffect, FormEvent } from "react";
+import { useState, useEffect, useRef, FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import "../styles/auth.css";
 import loginBg from "../assets/loginphoto.jpg";
 import registerBg from "../assets/loginphoto.jpg";
 import { useIsMobile } from "../hooks/use-mobile";
 import { useToast } from "../hooks/use-toast";
-
-type StoredUser = {
-  fullName?: string;
-  email: string;
-  password: string;
-  role: "owner" | "tenant";
-};
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signOut,
+  updateProfile,
+} from "firebase/auth";
+import { FirebaseError } from "firebase/app";
+import { auth } from "@/firebase/config";
+import { createUserDoc, getUserDoc } from "@/lib/firestore";
+import type { UserRole } from "@/types/firestore";
 
 const Auth = () => {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
   const { toast } = useToast();
+  const suppressRedirectRef = useRef(false);
 
   const [isLogin, setIsLogin] = useState(true);
 
@@ -44,62 +50,153 @@ const Auth = () => {
   const [registerShowPassword, setRegisterShowPassword] = useState(false);
   const [confirmShowPassword, setConfirmShowPassword] = useState(false);
 
-  useEffect(() => {
-    // auto-redirect if already logged in
+  const persistCurrentUser = (current: {
+    uid: string;
+    name: string;
+    email: string;
+    role: UserRole;
+    avatar?: string;
+  }) => {
     try {
-      const raw = localStorage.getItem("currentUser");
-      if (raw) {
-        const cu = JSON.parse(raw);
-        if (cu && cu.loggedIn) {
-          navigate("/interface");
-        }
-      }
+      localStorage.setItem(
+        "currentUser",
+        JSON.stringify({
+          uid: current.uid,
+          name: current.name,
+          email: current.email,
+          role: current.role,
+          avatar:
+            current.avatar ??
+            `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(current.name || "User")}`,
+          loggedIn: true,
+        })
+      );
     } catch {
-      /* ignore */
+      // best-effort persistence only
     }
+  };
 
-    // load remembered email (if any)
+  const clearPersistedCurrentUser = () => {
+    try {
+      localStorage.removeItem("currentUser");
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
     const remembered = localStorage.getItem("rememberedEmail");
     if (remembered) {
       setLoginEmail(remembered);
       setRememberMe(true);
     }
-  }, [navigate]);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!active) return;
+
+      if (!firebaseUser) {
+        clearPersistedCurrentUser();
+        return;
+      }
+
+      try {
+        const profile = await getUserDoc(firebaseUser.uid);
+        if (!active) return;
+
+        if (!profile) {
+          await signOut(auth);
+          clearPersistedCurrentUser();
+          toast({ title: "Account issue", description: "Your profile is missing. Please sign in again." });
+          return;
+        }
+
+        const role = normalizeRole(profile.role);
+        const name = profile.fullName || firebaseUser.displayName || firebaseUser.email || "User";
+        const email = firebaseUser.email ?? profile.email;
+        const avatar = firebaseUser.photoURL;
+        persistCurrentUser({ uid: firebaseUser.uid, name, email: email ?? "", role, avatar: avatar ?? undefined });
+
+        if (!suppressRedirectRef.current) {
+          navigate("/interface");
+        }
+      } catch (error) {
+        console.error("onAuthStateChanged failed", error);
+        clearPersistedCurrentUser();
+      }
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [navigate, toast]);
 
   const validateEmail = (email: string) =>
     /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
-
-  // add helpers to read/write the "users" profile store
-  type ProfileUser = {
-    name?: string;
-    email: string;
-    role?: "owner" | "tenant";
-    avatar?: string;
+  const normalizeRole = (value: unknown): UserRole | null => {
+    if (value === "owner" || value === "tenant") {
+      return value;
+    }
+    if (typeof value === "string") {
+      const lower = value.toLowerCase();
+      if (lower === "owner" || lower === "tenant") {
+        return lower as UserRole;
+      }
+    }
+    return null;
   };
 
-  function readUsersStore(): ProfileUser[] {
-    try {
-      const raw = localStorage.getItem("users");
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
+  const getLoginErrorMessage = (error: unknown) => {
+    if (error instanceof FirebaseError) {
+      switch (error.code) {
+        case "auth/invalid-email":
+        case "auth/user-not-found":
+        case "auth/wrong-password":
+        case "auth/invalid-credential":
+          return "Email or password is incorrect.";
+        case "auth/too-many-requests":
+          return "Too many attempts. Please try again later.";
+        default:
+          break;
+      }
     }
-  }
-  function writeUsersStore(users: ProfileUser[]) {
-    try {
-      localStorage.setItem("users", JSON.stringify(users));
-    } catch {}
-  }
-  function upsertProfile(user: ProfileUser) {
-    if (!user?.email) return;
-    const list = readUsersStore();
-    const idx = list.findIndex((u) => u.email.toLowerCase() === user.email.toLowerCase());
-    if (idx === -1) list.push(user);
-    else list[idx] = { ...list[idx], ...user };
-    writeUsersStore(list);
-  }
+    return "Please try again.";
+  };
 
-  const handleLoginSubmit = (e: FormEvent) => {
+  const getRegisterErrorMessage = (error: unknown) => {
+    if (error instanceof FirebaseError) {
+      switch (error.code) {
+        case "auth/email-already-in-use":
+          return "This email is already registered.";
+        case "auth/invalid-email":
+          return "Please enter a valid email address.";
+        case "auth/weak-password":
+          return "Password must be at least 6 characters long.";
+        default:
+          break;
+      }
+    }
+    return "An unexpected error occurred. Please try again.";
+  };
+
+  const getResetErrorMessage = (error: unknown) => {
+    if (error instanceof FirebaseError) {
+      switch (error.code) {
+        case "auth/invalid-email":
+          return "Please enter a valid email address.";
+        case "auth/user-not-found":
+          return "No account found with that email.";
+        default:
+          break;
+      }
+    }
+    return "Unable to send reset link. Please try again.";
+  };
+
+  const handleLoginSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (loginLoading) return;
 
@@ -113,70 +210,64 @@ const Auth = () => {
       return;
     }
 
+    const trimmedEmail = loginEmail.trim();
+    const normalizedEmail = trimmedEmail.toLowerCase();
+    suppressRedirectRef.current = true;
     setLoginLoading(true);
 
-    // simulate server delay
-    setTimeout(() => {
-      const users = (JSON.parse(localStorage.getItem("registeredUsers") || "[]") as StoredUser[]) || [];
-      const matched = users.find((u) => u.email.toLowerCase() === loginEmail.trim().toLowerCase());
+    try {
+      const credential = await signInWithEmailAndPassword(auth, trimmedEmail, loginPassword);
+      const data = await getUserDoc(credential.user.uid);
+      const storedRole = normalizeRole(data?.role);
 
-      if (!matched) {
-        setLoginLoading(false);
-        toast({ title: "Login failed", description: "Account not found. Please register first." });
+      if (!storedRole) {
+        await signOut(auth);
+        toast({ title: "Login failed", description: "User role not found. Please contact support." });
+        clearPersistedCurrentUser();
         return;
       }
 
-      // check role
-      if (matched.role !== loginRole) {
-        setLoginLoading(false);
+      if (storedRole !== loginRole) {
+        await signOut(auth);
         toast({ title: "Wrong account type", description: "Wrong account type." });
+        clearPersistedCurrentUser();
         return;
       }
 
-      // check password
-      if (matched.password !== loginPassword) {
-        setLoginLoading(false);
-        toast({ title: "Login failed", description: "Email or password is incorrect." });
-        return;
-      }
-
-      // remember email if requested
       if (rememberMe) {
-        localStorage.setItem("rememberedEmail", loginEmail.trim());
+        localStorage.setItem("rememberedEmail", normalizedEmail);
       } else {
         localStorage.removeItem("rememberedEmail");
       }
 
-      // read profile from "users" store (if present)
-      const profileList = readUsersStore();
-      const profile = profileList.find((p) => p.email.toLowerCase() === matched.email.toLowerCase());
+      const displayName = data?.fullName ?? credential.user.displayName ?? credential.user.email ?? "User";
+      const email = credential.user.email ?? data?.email ?? normalizedEmail;
 
-      const currentUser = {
-        name: profile?.name ?? matched.fullName ?? matched.email,
-        email: matched.email,
-        role: matched.role,
-        avatar: profile?.avatar ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(profile?.name ?? matched.fullName ?? matched.email)}`,
-        loggedIn: true,
-      };
-
-      // persist currentUser session
-      localStorage.setItem("currentUser", JSON.stringify(currentUser));
-
-      // ensure profile store has the up-to-date entry (so AccountSettings can update it later)
-      upsertProfile({ name: currentUser.name, email: currentUser.email, role: matched.role, avatar: currentUser.avatar });
-
-      setLoginLoading(false);
-      toast({
-        title: `Welcome back, ${currentUser.name}!`,
-        description: `You are logged in as ${currentUser.role}.`,
+      persistCurrentUser({
+        uid: credential.user.uid,
+        name: displayName,
+        email,
+        role: storedRole,
+        avatar: credential.user.photoURL ?? undefined,
       });
 
-      // redirect to interface
-      setTimeout(() => navigate("/interface"), 600);
-    }, 700);
+      toast({
+        title: `Welcome back, ${displayName}!`,
+        description: `You are logged in as ${storedRole}.`,
+      });
+
+      navigate("/interface");
+    } catch (error) {
+      toast({ title: "Login failed", description: getLoginErrorMessage(error) });
+      await signOut(auth).catch(() => undefined);
+      clearPersistedCurrentUser();
+    } finally {
+      suppressRedirectRef.current = false;
+      setLoginLoading(false);
+    }
   };
 
-  const handleRegisterSubmit = (e: FormEvent) => {
+  const handleRegisterSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (registerLoading) return;
 
@@ -200,43 +291,52 @@ const Auth = () => {
       return;
     }
 
+    suppressRedirectRef.current = true;
     setRegisterLoading(true);
 
-    setTimeout(() => {
-      const users = (JSON.parse(localStorage.getItem("registeredUsers") || "[]") as StoredUser[]) || [];
+    try {
+      const trimmedEmail = registerEmail.trim();
+      const normalizedEmail = trimmedEmail.toLowerCase();
+      const credential = await createUserWithEmailAndPassword(
+        auth,
+        trimmedEmail,
+        registerPassword
+      );
 
-      if (users.some((u) => u.email.toLowerCase() === registerEmail.trim().toLowerCase())) {
-        setRegisterLoading(false);
-        toast({ title: "Account already registered.", description: "Use another email or login." });
-        return;
+      if (fullName.trim()) {
+        await updateProfile(credential.user, { displayName: fullName.trim() });
       }
 
-      const newUser: StoredUser = {
+      const createdProfile = await createUserDoc(credential.user.uid, {
         fullName: fullName.trim(),
-        email: registerEmail.trim().toLowerCase(),
-        password: registerPassword,
+        email: credential.user.email ?? normalizedEmail,
         role: registerRole,
-      };
+      });
 
-      users.push(newUser);
-      localStorage.setItem("registeredUsers", JSON.stringify(users));
+      const emailForLogin = (credential.user.email ?? createdProfile.email ?? normalizedEmail).trim().toLowerCase();
 
-      // create profile entry in "users" store so AccountSettings can persist changes later
-      upsertProfile({ name: newUser.fullName, email: newUser.email, role: newUser.role, avatar: undefined });
+      await signOut(auth);
+      clearPersistedCurrentUser();
 
-      setRegisterLoading(false);
-      toast({ title: "Registration successful", description: "You can now log in with your credentials." });
+      toast({ title: "Registration successful", description: "Welcome to Homebase Finder!" });
 
-      // switch to login and pre-fill
+      setLoginRole(registerRole);
       setIsLogin(true);
-      setLoginEmail(newUser.email);
+      setLoginEmail(emailForLogin);
       setLoginPassword("");
-      setConfirmPassword("");
       setRegisterPassword("");
-    }, 700);
+      setConfirmPassword("");
+    } catch (error) {
+      toast({ title: "Registration failed", description: getRegisterErrorMessage(error) });
+      await signOut(auth).catch(() => undefined);
+      clearPersistedCurrentUser();
+    } finally {
+      suppressRedirectRef.current = false;
+      setRegisterLoading(false);
+    }
   };
 
-  const handleForgotPassword = (e: FormEvent) => {
+  const handleForgotPassword = async (e: FormEvent) => {
     e.preventDefault();
     if (!forgotEmail) {
       toast({ title: "Validation", description: "Please enter your email address." });
@@ -247,25 +347,32 @@ const Auth = () => {
       return;
     }
 
-    // simulate send
-    toast({ title: "Reset link sent", description: `Password reset link has been sent to ${forgotEmail}` });
-    setShowForgotPassword(false);
-    setForgotEmail("");
+    try {
+      await sendPasswordResetEmail(auth, forgotEmail.trim());
+      toast({
+        title: "Reset link sent",
+        description: `Password reset link has been sent to ${forgotEmail.trim()}`,
+      });
+      setShowForgotPassword(false);
+      setForgotEmail("");
+    } catch (error) {
+      toast({ title: "Reset failed", description: getResetErrorMessage(error) });
+    }
   };
 
   const toggleForm = () => setIsLogin((s) => !s);
 
   return (
     <div className={`auth-container ${isLogin ? "no-scroll-form" : ""}`}>
-      {/* Navigation arrows (visible on forms) - clicking redirects to index.html
+        {/* Navigation arrows (visible on forms) - jump back to the public landing page
           Show only LEFT arrow on the Login form and only RIGHT arrow on Register */}
       {isLogin ? (
         <button
           className="nav-arrow arrow-left"
           type="button"
           onClick={() => {
-            // navigate to static index.html
-            window.location.href = "/index";
+            // keep navigation within the SPA router
+            navigate("/index");
           }}
           aria-label="Go to home"
         >
@@ -279,7 +386,8 @@ const Auth = () => {
           className="nav-arrow arrow-right"
           type="button"
           onClick={() => {
-            window.location.href = "/index";
+            // mirror the login arrow behaviour for consistency
+            navigate("/index");
           }}
           aria-label="Go to home"
         >

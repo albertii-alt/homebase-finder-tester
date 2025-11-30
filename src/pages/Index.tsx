@@ -1,65 +1,58 @@
-import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { Home, Search, Shield, Users } from "lucide-react";
+import logoImg from "/HomebaseFinderOfficialLogo.png";
 
 const Index = () => {
   const navigate = useNavigate();
-  const [user, setUser] = useState<any>(null);
-
-  useEffect(() => {
-    const currentUser = localStorage.getItem('currentUser');
-    if (currentUser) {
-      setUser(JSON.parse(currentUser));
-    }
-  }, []);
-
-  const handleLogout = () => {
-    localStorage.removeItem('currentUser');
-    setUser(null);
-  };
-
-  if (!user) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-cyan-500 to-blue-600">
-        <div className="text-center">
-          <h1 className="mb-6 text-5xl font-bold text-white">Welcome to Homebase Finder</h1>
-          <p className="mb-8 text-xl text-white/90">Where home seekers meet and owners meet</p>
-          <button
-            onClick={() => navigate('/auth')}
-            className="px-8 py-3 bg-white text-blue-600 rounded-full font-semibold text-lg hover:bg-blue-50 transition-all"
-          >
-            Login / Register
-          </button>
-        </div>
-      </div>
-    );
-  }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-cyan-500 to-blue-600 p-8">
-      <div className="max-w-4xl mx-auto bg-white rounded-3xl shadow-2xl p-8">
-        <div className="flex items-center justify-between mb-8">
-          <div>
-            <h1 className="text-4xl font-bold text-gray-800 mb-2">Welcome back!</h1>
-            <p className="text-xl text-gray-600">{user.email}</p>
-          </div>
-          <button
-            onClick={handleLogout}
-            className="px-6 py-2 bg-red-500 text-white rounded-full font-semibold hover:bg-red-600 transition-all"
-          >
-            Logout
-          </button>
-        </div>
-        
-        <div className="bg-gradient-to-r from-cyan-50 to-blue-50 rounded-2xl p-6 mb-6">
-          <h2 className="text-2xl font-semibold text-gray-800 mb-3">Your Profile</h2>
-          <div className="space-y-2">
-            <p className="text-lg"><span className="font-semibold">Email:</span> {user.email}</p>
-            <p className="text-lg"><span className="font-semibold">Role:</span> {user.role}</p>
+    <div className="min-h-screen bg-gradient-to-br from-cyan-500 to-blue-600">
+      <div className="container mx-auto px-4 py-8">
+        {/* Hero Section */}
+        <div className="text-center py-20">
+          <img src={logoImg} alt="Homebase Finder" className="w-32 h-32 mx-auto mb-6 rounded-2xl shadow-lg" />
+          <h1 className="text-5xl md:text-6xl font-bold text-white mb-6">
+            Find Your Perfect
+            <br />
+            Boarding House
+          </h1>
+          <p className="text-xl text-white/90 mb-8 max-w-2xl mx-auto">
+            Connect with quality boarding houses or list your property to reach potential tenants
+          </p>
+          <div className="flex justify-center">
+            <Button size="lg" variant="outline" className="bg-white/10 text-white border-white hover:bg-white/20" onClick={() => navigate("/auth")}>
+              Get Started
+            </Button>
           </div>
         </div>
 
-        <div className="text-center py-8">
-          <p className="text-gray-600 text-lg">You're successfully logged in! 🎉</p>
+        {/* Features */}
+        <div className="grid md:grid-cols-3 gap-8 mt-20 mb-20">
+          <div className="bg-white/10 backdrop-blur-sm p-6 rounded-lg text-white">
+            <Search className="w-12 h-12 mb-4" />
+            <h3 className="text-xl font-bold mb-2">Easy Search</h3>
+            <p className="text-white/80">Find boarding houses that match your needs with our powerful search filters</p>
+          </div>
+          <div className="bg-white/10 backdrop-blur-sm p-6 rounded-lg text-white">
+            <Shield className="w-12 h-12 mb-4" />
+            <h3 className="text-xl font-bold mb-2">Verified Listings</h3>
+            <p className="text-white/80">All properties are verified to ensure quality and safety for our users</p>
+          </div>
+          <div className="bg-white/10 backdrop-blur-sm p-6 rounded-lg text-white">
+            <Users className="w-12 h-12 mb-4" />
+            <h3 className="text-xl font-bold mb-2">For Owners & Tenants</h3>
+            <p className="text-white/80">Whether you're looking for a place or listing one, we've got you covered</p>
+          </div>
+        </div>
+
+        {/* CTA */}
+        <div className="text-center bg-white/10 backdrop-blur-sm rounded-lg p-12">
+          <h2 className="text-3xl font-bold text-white mb-4">Ready to Get Started?</h2>
+          <p className="text-white/90 mb-6">Join our community today</p>
+          <Button size="lg" variant="secondary" onClick={() => navigate("/auth")}>
+            Sign Up Now
+          </Button>
         </div>
       </div>
     </div>

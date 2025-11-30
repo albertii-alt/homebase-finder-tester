@@ -3,10 +3,10 @@ import { Link, useNavigate, useLocation } from "react-router-dom";
 import { Sidebar } from "@/components/Sidebar";
 import "../styles/boardinghouse.css";
 import { useIsMobile } from "../hooks/use-mobile";
-import React from "react";
-import type { Room } from "../hooks/useBoardinghouseStorage";
-import { addRoom, getBoardinghousesByOwner } from "../hooks/useBoardinghouseStorage";
+import React, { useRef } from "react";
 import { useToast } from "../hooks/use-toast";
+import { createRoom } from "@/lib/firestore";
+import type { CreateRoomPayload } from "@/lib/firestore";
 
 export default function AddRoom() {
   const isMobile = useIsMobile();
@@ -99,15 +99,6 @@ export default function AddRoom() {
       return false;
     }
 
-    // ensure selected boardinghouse belongs to current owner
-    if (currentUser?.role === "owner" && currentUser.email) {
-      const owned = getBoardinghousesByOwner(currentUser.email);
-      if (!owned.find((b) => b.id === selectedBoardinghouseId)) {
-        alert("Selected boardinghouse does not belong to your account.");
-        return false;
-      }
-    }
-
     if (!roomName.trim()) {
       alert("Room name is required.");
       return false;
@@ -142,25 +133,23 @@ export default function AddRoom() {
     if (!validate()) return;
     setAdding(true);
     try {
-      const newRoom: Room = {
-        id: "", // hook will generate if empty
-        roomName: roomName.trim(),
-        totalBeds: Number(totalBeds),
-        availableBeds: Number(availableBeds),
-        rentPrice: Number(rentPrice),
+      const payload: CreateRoomPayload = {
+        number: roomName.trim(),
+        beds: Number(totalBeds),
+        bedsAvailable: Number(availableBeds),
+        price: Number(rentPrice),
         withCR,
-        gender,
-        cookingAllowed,
+        gender: gender as any,
+        cooking: cookingAllowed,
         inclusions,
+        status: Number(availableBeds) > 0 ? "Available" : "Occupied",
       };
-      const added = addRoom(selectedBoardinghouseId, newRoom);
-      if (!added) {
-        alert("Failed to add room. Boardinghouse not found or not owned by you.");
-      } else {
-        toast({ title: "Saved", description: "Room added successfully." });
-        resetForm();
-        // keep user on page to add more or navigate back
-      }
+      
+      await createRoom(selectedBoardinghouseId, payload);
+      
+      toast({ title: "Saved", description: "Room added successfully." });
+      resetForm();
+      // keep user on page to add more or navigate back
     } catch (err) {
       console.error(err);
       alert("Failed to add room.");

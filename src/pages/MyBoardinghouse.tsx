@@ -1,78 +1,112 @@
 import React from "react";
-import { ArrowLeft, Plus, Trash } from "lucide-react";
+import { Trash, Plus, Home, ArrowLeft } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { Link, useNavigate } from "react-router-dom";
 import { Sidebar } from "@/components/Sidebar";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import "../styles/boardinghouse.css";
 import { useIsMobile } from "../hooks/use-mobile";
-import type { Boardinghouse } from "../hooks/useBoardinghouseStorage";
-import {
-  getBoardinghousesByOwner,
-  deleteBoardinghouse,
-} from "../hooks/useBoardinghouseStorage";
 import { useToast } from "../hooks/use-toast";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "@/firebase/config";
+import { deleteBoardinghouse, listBoardinghouses, getUserDoc } from "@/lib/firestore";
+import type { BoardinghouseWithRooms, UserDoc } from "@/types/firestore";
 
 export default function MyBoardinghouse() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const { toast } = useToast();
-
-  const currentUser = React.useMemo(() => {
-    try {
-      return JSON.parse(localStorage.getItem("currentUser") ?? "null") as { email?: string; role?: string } | null;
-    } catch {
-      return null;
-    }
-  }, []);
+  const [ownerUid, setOwnerUid] = React.useState<string>("");
+  const [ownerProfile, setOwnerProfile] = React.useState<UserDoc | null>(null);
+  const [authChecking, setAuthChecking] = React.useState(true);
+  const [boardinghouses, setBoardinghouses] = React.useState<BoardinghouseWithRooms[]>([]);
+  const [dataLoading, setDataLoading] = React.useState(false);
 
   React.useEffect(() => {
-    if (!currentUser || currentUser.role !== "owner") {
-      toast({ title: "Access denied", description: "Owners only page." });
-      navigate("/interface");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    let active = true;
 
-  const ownerEmail = currentUser?.email ?? "";
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!active) return;
 
-  const [boardinghouses, setBoardinghouses] = React.useState<Boardinghouse[]>([]);
+      if (!firebaseUser) {
+        setOwnerUid("");
+        setOwnerProfile(null);
+        setAuthChecking(false);
+        toast({ title: "Access denied", description: "Please sign in as an owner." });
+        navigate("/auth");
+        return;
+      }
 
-  const load = React.useCallback(() => {
-    if (!ownerEmail) {
+      try {
+        const profile = await getUserDoc(firebaseUser.uid);
+        if (!active) return;
+
+        if (!profile || profile.role !== "owner") {
+          setOwnerUid("");
+          setOwnerProfile(null);
+          setAuthChecking(false);
+          toast({ title: "Access denied", description: "Owners only page." });
+          navigate("/interface");
+          return;
+        }
+
+        setOwnerUid(firebaseUser.uid);
+        setOwnerProfile(profile);
+        setAuthChecking(false);
+      } catch (error) {
+        console.error("Failed to load owner profile", error);
+        setOwnerUid("");
+        setOwnerProfile(null);
+        setAuthChecking(false);
+        toast({ title: "Authentication error", description: "Unable to load your profile." });
+        navigate("/auth");
+      }
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [navigate, toast]);
+
+  const fetchBoardinghouses = React.useCallback(async () => {
+    if (!ownerUid) {
       setBoardinghouses([]);
       return;
     }
-    const list = getBoardinghousesByOwner(ownerEmail);
-    setBoardinghouses(list);
-  }, [ownerEmail]);
+
+    setDataLoading(true);
+    try {
+      const result = await listBoardinghouses({ filters: { ownerId: ownerUid }, limit: 50 });
+      setBoardinghouses(result.boardinghouses);
+    } catch (error) {
+      console.error("Failed to load boardinghouses", error);
+      setBoardinghouses([]);
+      toast({ title: "Error", description: "Failed to load boardinghouses." });
+    } finally {
+      setDataLoading(false);
+    }
+  }, [ownerUid, toast]);
 
   React.useEffect(() => {
-    load();
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === "boardinghouses") {
-        load();
-      }
-    };
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, [load]);
+    if (!ownerUid) return;
+    void fetchBoardinghouses();
+  }, [ownerUid, fetchBoardinghouses]);
 
-  const handleDelete = (id: string) => {
+  const formatAddress = (bh: BoardinghouseWithRooms): string =>
+    [bh.street, bh.barangay, bh.city, bh.province, bh.zipcode].filter(Boolean).join(", ");
+
+  const handleDelete = async (id: string) => {
     const okConfirm = window.confirm("Are you sure you want to delete this boardinghouse?");
     if (!okConfirm) return;
 
-    const ok = deleteBoardinghouse(id);
-    if (!ok) {
+    try {
+      await deleteBoardinghouse(id);
+      toast({ title: "Deleted", description: "Boardinghouse deleted successfully." });
+      await fetchBoardinghouses();
+    } catch (error) {
+      console.error("Failed to delete boardinghouse", error);
       toast({ title: "Delete failed", description: "Failed to delete boardinghouse." });
-      return;
-    }
-
-    // refresh local list immediately
-    load();
-
-    toast({ title: "Deleted", description: "Boardinghouse deleted successfully." });
-
-    if (getBoardinghousesByOwner(ownerEmail).length === 0) {
-      toast({ title: "No boardinghouses found", description: "You have no boardinghouses left." });
     }
   };
 
@@ -85,20 +119,23 @@ export default function MyBoardinghouse() {
     navigate(`/edit-boardinghouse/${id}`);
   };
 
-  // Optional: Delete All (owner's boardinghouses) for testing
-  const handleDeleteAll = () => {
+  const handleDeleteAll = async () => {
     const okConfirm = window.confirm("Are you sure you want to delete ALL your boardinghouses? This cannot be undone.");
     if (!okConfirm) return;
 
-    // delete each boardinghouse for this owner
-    const list = getBoardinghousesByOwner(ownerEmail);
-    for (const bh of list) {
-      deleteBoardinghouse(bh.id);
+    try {
+      setDataLoading(true);
+      for (const bh of boardinghouses) {
+        await deleteBoardinghouse(bh.id);
+      }
+      toast({ title: "Deleted", description: "All boardinghouses deleted." });
+      await fetchBoardinghouses();
+    } catch (error) {
+      console.error("Failed to delete all boardinghouses", error);
+      toast({ title: "Error", description: "Failed to delete all boardinghouses." });
+    } finally {
+      setDataLoading(false);
     }
-
-    // refresh UI
-    load();
-    toast({ title: "Deleted", description: "All boardinghouses deleted." });
   };
 
   return (
@@ -164,7 +201,7 @@ export default function MyBoardinghouse() {
         </div>
 
         <div className="boardinghouse-list">
-          {boardinghouses.length === 0 ? (
+          {authChecking || dataLoading ? (
             <div
               className="empty-state"
               style={{
@@ -177,10 +214,38 @@ export default function MyBoardinghouse() {
                 textAlign: "center",
               }}
             >
-              <p style={{ margin: 0 }}>No boardinghouses yet. Add one to get started.</p>
-              <Link to="/add-boardinghouse" className="add-button" style={{ marginTop: 8 }}>
-                <Plus /> Add Boardinghouse
-              </Link>
+              <Card>
+                <CardContent className="flex flex-col items-center justify-center py-12">
+                  <Home className="w-16 h-16 text-muted-foreground mb-4" />
+                  <h3 className="text-xl font-semibold mb-2">Loading boarding houses...</h3>
+                  <p className="text-muted-foreground mb-4">Please wait while we fetch your listings.</p>
+                </CardContent>
+              </Card>
+            </div>
+          ) : boardinghouses.length === 0 ? (
+            <div
+              className="empty-state"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 12,
+                padding: 40,
+                textAlign: "center",
+              }}
+            >
+            <Card>
+              <CardContent className="flex flex-col items-center justify-center py-12">
+                <Home className="w-16 h-16 text-muted-foreground mb-4" />
+                  <h3 className="text-xl font-semibold mb-2">No boarding houses yet</h3>
+                  <p className="text-muted-foreground mb-4">Start by adding your first boarding house</p>
+                <Button onClick={() => navigate("/add-boardinghouse")}>
+                <Plus className="w-4 h-4 mr-2" />
+                Add Boarding House
+                </Button>
+              </CardContent>
+            </Card>
             </div>
           ) : (
             boardinghouses.map((bh) => (
@@ -192,9 +257,9 @@ export default function MyBoardinghouse() {
                 />
                 <div className="bh-info">
                   <h2>{bh.name}</h2>
-                  <p>{bh.address}</p>
-                  <p>Contact: {bh.contact}</p>
-                  <p>Rooms: {bh.rooms?.length ?? 0}</p>
+                  <p>{formatAddress(bh)}</p>
+                  <p>Contact: {bh.contact || "Not provided"}</p>
+                  <p>Rooms: {bh.totalRooms ?? bh.rooms?.length ?? 0}</p>
                   {/* Room list intentionally hidden in overview */}
                 </div>
                 <div className="bh-actions">

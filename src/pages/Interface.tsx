@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState, useRef } from "react";
-import { Menu, Home, Info, LayoutDashboard, HelpCircle, Shield, Settings, LogOut, Heart } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Menu, Home, Info, LayoutDashboard, HelpCircle, Shield, Settings, LogOut, Heart, type LucideIcon } from "lucide-react";
 import {
   Sheet,
   SheetContent,
@@ -18,39 +18,27 @@ import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router-dom";
 import LogoutModal from "@/components/LogoutModal";
 import regionsJson from "../ph-json/region.json";
+import { onAuthStateChanged, signOut as firebaseSignOut } from "firebase/auth";
+import { auth } from "@/firebase/config";
+import { getUserDoc, listBoardinghouses } from "@/lib/firestore";
+import type {
+  BoardinghouseWithRooms,
+  ListBoardinghousesParams,
+  RoomDoc,
+  UserRole,
+} from "@/types/firestore";
+import { useToast } from "@/hooks/use-toast";
 
 interface CurrentUser {
-  name?: string;
-  email?: string;
-  role?: string;
-  avatar?: string;
-  loggedIn?: boolean;
-}
-
-type Room = {
-  id: string;
-  roomName: string;
-  totalBeds: number;
-  availableBeds: number;
-  rentPrice: number;
-  withCR?: boolean;
-  gender?: string;
-  cookingAllowed?: boolean;
-  inclusions?: string[];
-};
-
-type Boardinghouse = {
-  id: string;
-  ownerEmail?: string;
-  ownerName?: string;
+  uid: string;
   name: string;
-  contact?: string;
-  address?: string;
-  description?: string;
-  facebook?: string;
-  photos?: string[];
-  rooms?: Room[];
-};
+  email: string;
+  role: UserRole;
+  avatar: string;
+  loggedIn: boolean;
+}
+type Room = RoomDoc;
+type Boardinghouse = BoardinghouseWithRooms;
 
 type Region = {
   id: number;
@@ -79,31 +67,34 @@ const genderLabelMap: Record<GenderFilterValue, string> = {
   any: "Any",
 };
 
+const priceRangeQueryMap: Record<PriceFilterValue, { min?: number; max?: number }> = {
+  "below-500": { max: 499.99 },
+  "500-1000": { min: 500, max: 1000 },
+  "1000-above": { min: 1000 },
+};
+
+const genderFilterMap: Record<GenderFilterValue, RoomDoc["gender"]> = {
+  male: "Male",
+  female: "Female",
+  any: "Any",
+};
+
 const regionMatchesBoardinghouse = (bh: Boardinghouse, regionCode: string): boolean => {
+  if (!regionCode) return true;
+  if (bh.region === regionCode) return true;
   const region = REGIONS.find((r) => r.region_code === regionCode);
   if (!region) return false;
-
-  const address = (bh.address ?? "").toLowerCase();
   const regionName = region.region_name.toLowerCase();
-  if (address.includes(regionName)) return true;
-
-  const candidates = [
-    (bh as any).regionCode,
-    (bh as any).region_code,
-    (bh as any).region,
-    (bh as any).regionName,
-    (bh as any).region_name,
-  ]
+  const addressTokens = [bh.region, bh.province, bh.city, bh.barangay]
     .filter(Boolean)
-    .map((value) => String(value).toLowerCase());
-
-  return candidates.some((value) => value === regionCode || regionName.includes(value) || value.includes(regionName));
+    .map((value) => value.toLowerCase());
+  return addressTokens.some((value) => value === regionCode || value.includes(regionName) || regionName.includes(value));
 };
 
 const priceMatchesBoardinghouse = (bh: Boardinghouse, range: PriceFilterValue): boolean => {
   if (!bh.rooms || bh.rooms.length === 0) return false;
   return bh.rooms.some((room) => {
-    const price = Number(room.rentPrice ?? 0);
+    const price = Number(room.price ?? 0);
     if (!Number.isFinite(price)) return false;
     switch (range) {
       case "below-500":
@@ -123,8 +114,7 @@ const genderMatchesBoardinghouse = (bh: Boardinghouse, gender: GenderFilterValue
     return gender === "any";
   }
   return bh.rooms.some((room) => {
-    const value = String(room.gender ?? "").toLowerCase();
-    if (!value) return gender === "any";
+    const value = String(room.gender ?? "Any").toLowerCase();
     if (gender === "any") {
       return ["any", "either", "mixed", "coed", "co-ed", "unisex"].some((token) => value.includes(token));
     }
@@ -132,24 +122,151 @@ const genderMatchesBoardinghouse = (bh: Boardinghouse, gender: GenderFilterValue
   });
 };
 
+const formatAddress = (bh: Boardinghouse): string => {
+  return [bh.street, bh.barangay, bh.city, bh.province, bh.zipcode].filter(Boolean).join(", ");
+};
+
 const Interface = () => {
-  const navigate = useNavigate();
-  const [isOpen, setIsOpen] = useState(false);
-
-  // read current user from localStorage (set by Auth.tsx)
-  const raw = typeof window !== "undefined" ? localStorage.getItem("currentUser") : null;
-  const parsed: CurrentUser | null = raw ? JSON.parse(raw) : null;
-
-  const user: CurrentUser = {
-    name: parsed?.name ?? "Guest",
-    email: parsed?.email ?? "",
-    role: (parsed?.role ?? "tenant").toString().toLowerCase(),
-    avatar: parsed?.avatar ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(parsed?.name ?? "Guest")}`,
-    loggedIn: parsed?.loggedIn ?? false,
+  const loadStoredUser = (): CurrentUser | null => {
+    try {
+      if (typeof window === "undefined") return null;
+      const raw = localStorage.getItem("currentUser");
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as Partial<CurrentUser> | null;
+      if (!parsed || typeof parsed !== "object" || !parsed.uid) return null;
+      return {
+        uid: String(parsed.uid),
+        name: parsed.name ? String(parsed.name) : "Guest",
+        email: parsed.email ? String(parsed.email) : "",
+        role: parsed.role === "owner" ? "owner" : "tenant",
+        avatar:
+          parsed.avatar ??
+          `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(
+            parsed.name ? String(parsed.name) : "Guest",
+          )}`,
+        loggedIn: Boolean(parsed.loggedIn),
+      };
+    } catch {
+      return null;
+    }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem("currentUser");
+  const navigate = useNavigate();
+  const { toast } = useToast();
+  const [isOpen, setIsOpen] = useState(false);
+  const [user, setUser] = useState<CurrentUser | null>(() => loadStoredUser());
+  const [userLoading, setUserLoading] = useState<boolean>(() => !loadStoredUser());
+
+  const persistLocalUser = (profile: CurrentUser | null) => {
+    try {
+      if (!profile) {
+        localStorage.removeItem("currentUser");
+        return;
+      }
+      localStorage.setItem(
+        "currentUser",
+        JSON.stringify({
+          uid: profile.uid,
+          name: profile.name,
+          email: profile.email,
+          role: profile.role,
+          avatar: profile.avatar,
+          loggedIn: profile.loggedIn,
+        })
+      );
+    } catch {
+      // ignore persistence failures
+    }
+  };
+
+  const normalizeRole = (value: unknown): UserRole => {
+    if (value === "owner" || value === "tenant") {
+      return value;
+    }
+    if (typeof value === "string") {
+      const lower = value.toLowerCase();
+      if (lower === "owner" || lower === "tenant") {
+        return lower as UserRole;
+      }
+    }
+    return "tenant";
+  };
+
+  useEffect(() => {
+    let active = true;
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!active) return;
+
+      if (!firebaseUser) {
+        setUser(null);
+        persistLocalUser(null);
+        setUserLoading(false);
+        return;
+      }
+
+      try {
+        const profileDoc = await getUserDoc(firebaseUser.uid);
+
+        if (!profileDoc) {
+          throw new Error("user_profile_missing");
+        }
+
+        const role = normalizeRole(profileDoc.role);
+        const name = profileDoc.fullName ?? firebaseUser.displayName ?? firebaseUser.email ?? "User";
+        const email = firebaseUser.email ?? profileDoc.email ?? "";
+        const avatar =
+          firebaseUser.photoURL ??
+          `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(name)}`;
+
+        if (!active) return;
+
+        const profile: CurrentUser = {
+          uid: firebaseUser.uid,
+          name,
+          email,
+          role,
+          avatar,
+          loggedIn: true,
+        };
+        setUser(profile);
+        persistLocalUser(profile);
+      } catch (error) {
+        console.error("Failed to load user profile", error);
+        toast({ title: "Authentication error", description: "Unable to load your profile. Please sign in again." });
+        await firebaseSignOut(auth).catch(() => undefined);
+        if (!active) return;
+        setUser(null);
+        persistLocalUser(null);
+      } finally {
+        if (!active) return;
+        setUserLoading(false);
+      }
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [toast]);
+
+  const resolvedUser: CurrentUser = user ?? {
+    uid: "",
+    name: "Guest",
+    email: "",
+    role: "tenant",
+    avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent("Guest")}`,
+    loggedIn: false,
+  };
+
+  const handleLogout = async () => {
+    try {
+      await firebaseSignOut(auth);
+    } catch (error) {
+      toast({ title: "Logout failed", description: "Please try again." });
+      return;
+    }
+
+    persistLocalUser(null);
     navigate("/auth");
   };
 
@@ -158,17 +275,24 @@ const Interface = () => {
   const menuItems = [
     { icon: Home, label: "Home", onClick: () => navigate("/interface") },
     { icon: Info, label: "About", onClick: () => navigate("/about") },
-    { icon: Heart, label: "Favorites", onClick: () => navigate("/favorites") },
-    // Dashboard only visible for owners
-    ...(user.role === "owner" ? [{ icon: LayoutDashboard, label: "Dashboard", onClick: () => navigate("/dashboard") }] : []),
+    resolvedUser.loggedIn
+      ? { icon: Heart, label: "Favorites", onClick: () => navigate("/favorites") }
+      : { icon: Heart, label: "Favorites", onClick: () => navigate("/auth") },
+    resolvedUser.role === "owner"
+      ? { icon: LayoutDashboard, label: "Dashboard", onClick: () => navigate("/dashboard") }
+      : null,
     { icon: HelpCircle, label: "Help", onClick: () => {} },
     { icon: Shield, label: "Privacy & Policy", onClick: () => {} },
-    { icon: Settings, label: "Settings", onClick: () => {} },
-    { icon: LogOut, label: "Logout", onClick: () => setShowLogoutModal(true) },
-  ];
+    resolvedUser.loggedIn
+      ? { icon: Settings, label: "Settings", onClick: () => {} }
+      : { icon: Settings, label: "Login / Register", onClick: () => navigate("/auth") },
+    resolvedUser.loggedIn ? { icon: LogOut, label: "Logout", onClick: () => setShowLogoutModal(true) } : null,
+  ].filter(Boolean) as Array<{ icon: LucideIcon; label: string; onClick: () => void }>;
 
-  // local state for boardinghouses loaded from localStorage
+  // boardinghouses fetched from Firestore
   const [boardinghouses, setBoardinghouses] = useState<Boardinghouse[]>([]);
+  const [boardinghousesLoading, setBoardinghousesLoading] = useState(true);
+  const [boardinghousesError, setBoardinghousesError] = useState<string | null>(null);
 
   // filters / search (input values)
   const [searchInput, setSearchInput] = useState("");
@@ -182,58 +306,52 @@ const Interface = () => {
   const [appliedPrice, setAppliedPrice] = useState<PriceFilterValue | null>(null);
   const [appliedGender, setAppliedGender] = useState<GenderFilterValue | null>(null);
 
-  // keep last serialized value to detect same-tab changes (storage event won't fire in same tab)
-  const lastDataRef = useRef<string>("");
-
-  const loadFromStorage = () => {
-    try {
-      const rawBH = localStorage.getItem("boardinghouses");
-      if (!rawBH) {
-        setBoardinghouses([]);
-        lastDataRef.current = "[]";
-        return;
+  const firestoreFilters = useMemo(() => {
+    const filters: ListBoardinghousesParams["filters"] = {};
+    if (appliedRegion) {
+      filters.regionCode = appliedRegion;
+      const regionMatch = REGIONS.find((region) => region.region_code === appliedRegion);
+      if (regionMatch) {
+        filters.region = regionMatch.region_name;
       }
-      // parse and normalize
-      const parsedBH = JSON.parse(rawBH) as Boardinghouse[] | null;
-      const arr = Array.isArray(parsedBH) ? parsedBH : [];
-      setBoardinghouses(arr);
-      lastDataRef.current = rawBH;
-    } catch (err) {
-      console.warn("Failed to parse boardinghouses from localStorage", err);
-      setBoardinghouses([]);
-      lastDataRef.current = "[]";
     }
-  };
+    if (appliedPrice) filters.priceRange = priceRangeQueryMap[appliedPrice];
+    if (appliedGender) filters.gender = genderFilterMap[appliedGender];
+    return Object.keys(filters).length ? filters : undefined;
+  }, [appliedRegion, appliedPrice, appliedGender]);
 
   useEffect(() => {
-    loadFromStorage();
+    let active = true;
 
-    // respond to storage events (other windows / tabs)
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === "boardinghouses") {
-        loadFromStorage();
+    const fetchBoardinghouses = async () => {
+      setBoardinghousesLoading(true);
+      setBoardinghousesError(null);
+      try {
+        const result = await listBoardinghouses({
+          limit: 40,
+          filters: firestoreFilters,
+        });
+        if (!active) return;
+        setBoardinghouses(result.boardinghouses);
+      } catch (error) {
+        if (!active) return;
+        console.error("Failed to load boardinghouses", error);
+        setBoardinghouses([]);
+        setBoardinghousesError("Unable to load boardinghouses.");
+        toast({ title: "Failed to load listings", description: "Please try again." });
+      } finally {
+        if (active) {
+          setBoardinghousesLoading(false);
+        }
       }
     };
-    window.addEventListener("storage", onStorage);
 
-    // simple same-tab polling to detect changes made elsewhere in app
-    const interval = setInterval(() => {
-      try {
-        const rawBH = localStorage.getItem("boardinghouses") ?? "[]";
-        if (rawBH !== lastDataRef.current) {
-          loadFromStorage();
-        }
-      } catch {
-        // ignore
-      }
-    }, 800);
+    fetchBoardinghouses();
 
     return () => {
-      window.removeEventListener("storage", onStorage);
-      clearInterval(interval);
+      active = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [firestoreFilters, toast]);
 
   // derive unique location options from loaded boardinghouses
   const selectedRegion = useMemo(
@@ -242,7 +360,7 @@ const Interface = () => {
   );
 
   const filterChips = useMemo(() => {
-     const chips: { label: string; value: string }[] = [];
+    const chips: { label: string; value: string }[] = [];
     if (appliedSearch.trim()) chips.push({ label: "Search", value: `"${appliedSearch.trim()}"` });
     if (selectedRegion) chips.push({ label: "Region", value: selectedRegion.region_name });
     if (appliedPrice) chips.push({ label: "Price", value: priceLabelMap[appliedPrice] });
@@ -250,6 +368,13 @@ const Interface = () => {
     return chips;
   }, [appliedSearch, selectedRegion, appliedPrice, appliedGender]);
 
+  if (userLoading) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 flex items-center justify-center">
+        <div className="text-slate-500 text-sm font-medium tracking-wide">Loading interface…</div>
+      </div>
+    );
+  }
   const handleClearFilters = () => {
     setSearchInput("");
     setRegionInput(null);
@@ -275,7 +400,7 @@ const Interface = () => {
       // search by name or address
       if (q) {
         const inName = bh.name?.toLowerCase().includes(q);
-        const inAddress = bh.address?.toLowerCase().includes(q);
+        const inAddress = formatAddress(bh).toLowerCase().includes(q);
         if (!inName && !inAddress) return false;
       }
       if (appliedRegion && !regionMatchesBoardinghouse(bh, appliedRegion)) {
@@ -291,11 +416,6 @@ const Interface = () => {
       return true;
     });
   }, [boardinghouses, appliedSearch, appliedRegion, appliedPrice, appliedGender]);
-
-  const hasAvailableRooms = (bh: Boardinghouse) => {
-    if (!bh.rooms || bh.rooms.length === 0) return false;
-    return bh.rooms.some((r) => Number(r.availableBeds) > 0);
-  };
 
   const [favoriteIds, setFavoriteIds] = useState<string[]>(() => {
     try {
@@ -348,7 +468,7 @@ const Interface = () => {
 
               {/* For desktop we only show login/register when NOT logged in.
                   When logged in, user profile + logout are available in the sidebar (Sheet). */}
-              {!user.loggedIn && (
+              {!resolvedUser.loggedIn && (
                 <div className="flex items-center gap-4">
                   <a href="/auth" className="text-white font-semibold hover:text-cyan-100 transition-colors">
                     Login
@@ -372,13 +492,13 @@ const Interface = () => {
                   {/* User Profile - use real currentUser data */}
                   <div className="flex flex-col items-center py-6 border-b">
                     <img
-                      src={user.avatar}
-                      alt={user.name}
+                      src={resolvedUser.avatar}
+                      alt={resolvedUser.name}
                       className="w-24 h-24 rounded-full mb-3 bg-gradient-to-br from-cyan-400 to-blue-500 p-1"
                     />
-                    <h3 className="text-xl font-bold text-foreground">{user.name}</h3>
-                    <p className="text-sm text-muted-foreground">{user.email}</p>
-                    <p className="text-sm text-muted-foreground capitalize mt-1">{user.role}</p>
+                    <h3 className="text-xl font-bold text-foreground">{resolvedUser.name}</h3>
+                    <p className="text-sm text-muted-foreground">{resolvedUser.email}</p>
+                    <p className="text-sm text-muted-foreground capitalize mt-1">{resolvedUser.role}</p>
                   </div>
 
                   {/* Menu Items */}
@@ -406,8 +526,7 @@ const Interface = () => {
               open={showLogoutModal}
               onClose={() => setShowLogoutModal(false)}
               onConfirm={() => {
-                handleLogout();
-                setShowLogoutModal(false);
+                handleLogout().finally(() => setShowLogoutModal(false));
               }}
             />
           </div>
@@ -531,7 +650,15 @@ const Interface = () => {
         {/* Properties Section */}
         <div className="mb-6">
           <h2 className="text-3xl font-bold text-foreground mb-6">All Boardinghouses</h2>
-          {filtered.length === 0 ? (
+          {boardinghousesLoading ? (
+            <div className="bg-white rounded-2xl shadow-inner border border-dashed border-slate-300 p-10 text-center text-slate-600">
+              Loading boardinghouses...
+            </div>
+          ) : boardinghousesError ? (
+            <div className="bg-white rounded-2xl shadow-inner border border-dashed border-slate-300 p-10 text-center text-slate-600">
+              {boardinghousesError}
+            </div>
+          ) : filtered.length === 0 ? (
             <div className="bg-white rounded-2xl shadow-inner border border-dashed border-slate-300 p-10 text-center text-slate-600">
               No boardinghouses match your current filters.
             </div>
@@ -539,11 +666,11 @@ const Interface = () => {
             <div className="space-y-6">
               {filtered.map((property) => {
                 const firstPricedRoom = property.rooms?.find(
-                  (room) => typeof room.rentPrice === "number"
+                  (room) => typeof room.price === "number"
                 );
                 const formattedPrice =
-                  firstPricedRoom && Number.isFinite(firstPricedRoom.rentPrice)
-                    ? `₱${Number(firstPricedRoom.rentPrice).toLocaleString()} / month`
+                  firstPricedRoom && Number.isFinite(firstPricedRoom.price)
+                    ? `₱${Number(firstPricedRoom.price).toLocaleString()} / month`
                     : "Price not available";
                 const isFavorite = favoriteIds.includes(property.id);
 
@@ -586,7 +713,7 @@ const Interface = () => {
                               clipRule="evenodd"
                             />
                           </svg>
-                          <span className="text-sm">{property.address}</span>
+                          <span className="text-sm">{formatAddress(property)}</span>
                         </div>
 
                         <div className="text-2xl font-bold mb-4">{formattedPrice}</div>
