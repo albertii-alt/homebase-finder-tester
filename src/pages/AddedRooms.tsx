@@ -190,7 +190,11 @@ export default function AddedRooms(): JSX.Element {
         <div style={{ maxWidth: 980, marginTop: 18 }}>
           <div style={{ marginBottom: 14, color: "#374151" }}>
             <strong style={{ display: "block", fontSize: 16 }}>{boardinghouse.name}</strong>
-            <small style={{ color: "#6b7280" }}>{boardinghouse.address}</small>
+            <small style={{ color: "#6b7280" }}>
+              {[boardinghouse.street, boardinghouse.barangay, boardinghouse.city, boardinghouse.province]
+                .filter(Boolean)
+                .join(", ")}
+            </small>
           </div>
 
           <div style={{ display: "grid", gap: 12 }}>
@@ -214,9 +218,9 @@ export default function AddedRooms(): JSX.Element {
                   }}
                 >
                   <div>
-                    <div style={{ fontSize: 18, fontWeight: 700 }}>{r.roomName}</div>
+                    <div style={{ fontSize: 18, fontWeight: 700 }}>{r.number}</div>
                     <div style={{ color: "#0f172a", opacity: 0.8, marginTop: 6 }}>
-                      ₱{Number(r.rentPrice).toLocaleString()}/month - {r.availableBeds ?? 0}
+                      ₱{Number(r.price ?? 0).toLocaleString()}/month · Beds available: {r.bedsAvailable ?? 0}
                     </div>
                   </div>
 

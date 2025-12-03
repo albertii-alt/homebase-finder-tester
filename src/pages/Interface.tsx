@@ -21,6 +21,7 @@ import regionsJson from "../ph-json/region.json";
 import { onAuthStateChanged, signOut as firebaseSignOut } from "firebase/auth";
 import { auth } from "@/firebase/config";
 import { getUserDoc, listBoardinghouses } from "@/lib/firestore";
+import { buildFavoritesStorageKey, CURRENT_USER_CHANGED_EVENT } from "@/lib/utils";
 import type {
   BoardinghouseWithRooms,
   ListBoardinghousesParams,
@@ -161,21 +162,25 @@ const Interface = () => {
     try {
       if (!profile) {
         localStorage.removeItem("currentUser");
-        return;
+      } else {
+        localStorage.setItem(
+          "currentUser",
+          JSON.stringify({
+            uid: profile.uid,
+            name: profile.name,
+            email: profile.email,
+            role: profile.role,
+            avatar: profile.avatar,
+            loggedIn: profile.loggedIn,
+          })
+        );
       }
-      localStorage.setItem(
-        "currentUser",
-        JSON.stringify({
-          uid: profile.uid,
-          name: profile.name,
-          email: profile.email,
-          role: profile.role,
-          avatar: profile.avatar,
-          loggedIn: profile.loggedIn,
-        })
-      );
     } catch {
       // ignore persistence failures
+    } finally {
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event(CURRENT_USER_CHANGED_EVENT));
+      }
     }
   };
 
@@ -215,6 +220,7 @@ const Interface = () => {
         const name = profileDoc.fullName ?? firebaseUser.displayName ?? firebaseUser.email ?? "User";
         const email = firebaseUser.email ?? profileDoc.email ?? "";
         const avatar =
+          profileDoc.avatarUrl ??
           firebaseUser.photoURL ??
           `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(name)}`;
 
@@ -417,22 +423,62 @@ const Interface = () => {
     });
   }, [boardinghouses, appliedSearch, appliedRegion, appliedPrice, appliedGender]);
 
-  const [favoriteIds, setFavoriteIds] = useState<string[]>(() => {
-    try {
-      const stored = localStorage.getItem("favoriteBoardinghouses");
-      const parsedFav = stored ? JSON.parse(stored) : [];
-      return Array.isArray(parsedFav) ? parsedFav : [];
-    } catch {
-      return [];
-    }
-  });
+  const favoritesKey = useMemo(
+    () => buildFavoritesStorageKey(resolvedUser.uid, resolvedUser.loggedIn),
+    [resolvedUser.uid, resolvedUser.loggedIn]
+  );
+
+  const [favoriteIds, setFavoriteIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const loadFavorites = () => {
+      const candidateKeys = [favoritesKey, "favoriteBoardinghouses"];
+      for (const key of candidateKeys) {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            setFavoriteIds(parsed);
+            if (key !== favoritesKey) {
+              localStorage.setItem(favoritesKey, JSON.stringify(parsed));
+              localStorage.removeItem("favoriteBoardinghouses");
+            }
+            return;
+          }
+        } catch {
+          // ignore invalid stored data
+        }
+      }
+      setFavoriteIds([]);
+    };
+
+    loadFavorites();
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === favoritesKey || event.key === "favoriteBoardinghouses") {
+        loadFavorites();
+      }
+    };
+
+    window.addEventListener("storage", handleStorage);
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+    };
+  }, [favoritesKey]);
 
   const toggleFavorite = (boardinghouseId: string) => {
     setFavoriteIds((prev) => {
       const next = prev.includes(boardinghouseId)
         ? prev.filter((id) => id !== boardinghouseId)
         : [...prev, boardinghouseId];
-      localStorage.setItem("favoriteBoardinghouses", JSON.stringify(next));
+      try {
+        localStorage.setItem(favoritesKey, JSON.stringify(next));
+      } catch {
+        // ignore storage failures
+      }
       return next;
     });
   };

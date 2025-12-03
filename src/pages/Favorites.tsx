@@ -1,25 +1,88 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowLeft, Heart } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import "../styles/interface.css";
 import { getBoardinghouseById } from "@/lib/firestore";
+import { buildFavoritesStorageKey, CURRENT_USER_CHANGED_EVENT } from "@/lib/utils";
 import type { BoardinghouseWithRooms } from "@/types/firestore";
+
+const resolveFavoritesKey = (): string => {
+  if (typeof window === "undefined") {
+    return buildFavoritesStorageKey(null, false);
+  }
+  try {
+    const raw = window.localStorage.getItem("currentUser");
+    if (!raw) {
+      return buildFavoritesStorageKey(null, false);
+    }
+    const parsed = JSON.parse(raw) as { uid?: string; loggedIn?: boolean } | null;
+    const uid = parsed && typeof parsed.uid === "string" ? parsed.uid : null;
+    const loggedIn = Boolean(parsed?.loggedIn);
+    return buildFavoritesStorageKey(uid, loggedIn);
+  } catch {
+    return buildFavoritesStorageKey(null, false);
+  }
+};
 
 const Favorites = () => {
   const navigate = useNavigate();
+  const [favoritesKey, setFavoritesKey] = useState(() => resolveFavoritesKey());
   const [favorites, setFavorites] = useState<string[]>([]);
   const [boardinghouses, setBoardinghouses] = useState<BoardinghouseWithRooms[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    try {
-      const storedFav = JSON.parse(localStorage.getItem("favoriteBoardinghouses") ?? "[]");
-      setFavorites(Array.isArray(storedFav) ? storedFav : []);
-    } catch {
+    if (typeof window === "undefined") return;
+
+    const loadFavorites = () => {
+      const candidateKeys = [favoritesKey, "favoriteBoardinghouses"];
+      for (const key of candidateKeys) {
+        const raw = window.localStorage.getItem(key);
+        if (!raw) continue;
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            setFavorites(parsed);
+            if (key !== favoritesKey) {
+              window.localStorage.setItem(favoritesKey, JSON.stringify(parsed));
+              window.localStorage.removeItem("favoriteBoardinghouses");
+            }
+            return;
+          }
+        } catch {
+          // ignore malformed persisted data
+        }
+      }
       setFavorites([]);
-    }
-  }, []);
+    };
+
+    loadFavorites();
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === "currentUser") {
+        const nextKey = resolveFavoritesKey();
+        setFavoritesKey(nextKey);
+        return;
+      }
+      if (event.key === favoritesKey || event.key === "favoriteBoardinghouses") {
+        loadFavorites();
+      }
+    };
+
+    const handleUserChange: EventListener = () => {
+      const nextKey = resolveFavoritesKey();
+      setFavoritesKey(nextKey);
+    };
+
+    window.addEventListener("storage", handleStorage);
+    window.addEventListener(CURRENT_USER_CHANGED_EVENT, handleUserChange);
+
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      window.removeEventListener(CURRENT_USER_CHANGED_EVENT, handleUserChange);
+    };
+  }, [favoritesKey]);
 
   useEffect(() => {
     const fetchFavorites = async () => {
@@ -46,7 +109,11 @@ const Favorites = () => {
   const toggleFavorite = (id: string) => {
     setFavorites((prev) => {
       const next = prev.includes(id) ? prev.filter((fav) => fav !== id) : [...prev, id];
-      localStorage.setItem("favoriteBoardinghouses", JSON.stringify(next));
+      try {
+        window.localStorage.setItem(favoritesKey, JSON.stringify(next));
+      } catch {
+        // ignore persistence failures
+      }
       return next;
     });
   };

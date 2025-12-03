@@ -7,6 +7,7 @@ export interface UserDoc {
   fullName: string;
   email: string;
   role: UserRole;
+  avatarUrl?: string;
   createdAt?: Timestamp | null;
 }
 

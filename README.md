@@ -34,6 +34,9 @@ npm i
 
 # Step 4: Start the development server with auto-reloading and an instant preview.
 npm run dev
+
+# (Optional) Start with Firebase emulators (persisting data between restarts).
+npm run dev:emulators
 ```
 
 **Edit a file directly in GitHub**
@@ -63,6 +66,13 @@ This project is built with:
 ## How can I deploy this project?
 
 Simply open [Lovable](https://lovable.dev/projects/31208b6f-a6b4-4b5c-93f5-b15a147e124c) and click on Share -> Publish.
+
+## Working with Firebase emulators
+
+- Run `npm run emulators` to launch the Firebase emulators with state persisted in `.firebase-data/` (storage uploads and Firestore docs survive restarts).
+- Use `npm run dev:emulators` to start Vite alongside the emulators for local development.
+- Set `VITE_USE_FIREBASE_EMULATORS=true` in your `.env.local` if you need the app to connect to the emulators outside of `npm run dev` (for example when running `npm run preview`).
+- Adjust emulator host/port via `VITE_FIREBASE_EMULATOR_*` env vars if your setup uses non-default ports.
 
 ## Can I connect a custom domain to my Lovable project?
 

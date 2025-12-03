@@ -19,7 +19,7 @@ import {
   type QueryConstraint,
   type QueryDocumentSnapshot,
 } from "firebase/firestore";
-import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
+import { deleteObject, getDownloadURL, listAll, ref, uploadBytes } from "firebase/storage";
 import { auth, db, storage } from "@/firebase/config";
 import type {
   BoardinghouseDoc,
@@ -67,6 +67,7 @@ export interface CreateUserPayload {
   fullName: string;
   email: string;
   role: UserRole;
+  avatarUrl?: string;
 }
 
 export interface CreateBoardinghousePayload {
@@ -121,6 +122,43 @@ const buildStoragePath = (basePath: string, fileName: string): string => {
   const extension = fileName.includes(".") ? fileName.split(".").pop() : "jpg";
   const uniqueSuffix = `${Date.now()}-${normalizeUuid()}`;
   return `${sanitizedBase}/${uniqueSuffix}.${extension}`;
+};
+
+const isStorageNotFound = (error: unknown): boolean => {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: string }).code;
+  return code === "storage/object-not-found";
+};
+
+const deleteStorageTree = async (fullPath: string): Promise<void> => {
+  try {
+    const rootRef = ref(storage, fullPath);
+    const stack = [rootRef];
+
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (!current) continue;
+      const listing = await listAll(current);
+      if (listing.prefixes.length) {
+        stack.push(...listing.prefixes);
+      }
+      if (listing.items.length) {
+        await Promise.all(
+          listing.items.map((itemRef) =>
+            deleteObject(itemRef).catch((error) => {
+              if (!isStorageNotFound(error)) {
+                console.warn(`Failed to delete storage object ${itemRef.fullPath}`, error);
+              }
+            })
+          )
+        );
+      }
+    }
+  } catch (error) {
+    if (!isStorageNotFound(error)) {
+      console.warn(`Failed to delete storage tree at ${fullPath}`, error);
+    }
+  }
 };
 
 const mapBoardinghouseSnapshot = (
@@ -183,6 +221,7 @@ export const createUserDoc = async (uid: string, payload: CreateUserPayload): Pr
       fullName: payload.fullName,
       email: payload.email.toLowerCase(),
       role: payload.role,
+      avatarUrl: payload.avatarUrl ?? null,
       createdAt: serverTimestamp(),
     });
     const snapshot = await getDoc(userRef);
@@ -192,6 +231,7 @@ export const createUserDoc = async (uid: string, payload: CreateUserPayload): Pr
       fullName: String(data.fullName ?? payload.fullName),
       email: String(data.email ?? payload.email).toLowerCase(),
       role: (data.role as UserRole | undefined) ?? payload.role,
+      avatarUrl: data.avatarUrl ? String(data.avatarUrl) : undefined,
       createdAt: data.createdAt ?? null,
     };
   } catch (error) {
@@ -210,6 +250,7 @@ export const getUserDoc = async (uid: string): Promise<UserDoc | null> => {
       fullName: String(data.fullName ?? ""),
       email: String(data.email ?? ""),
       role: (data.role as UserRole | undefined) ?? "tenant",
+      avatarUrl: data.avatarUrl ? String(data.avatarUrl) : undefined,
       createdAt: data.createdAt ?? null,
     };
   } catch (error) {
@@ -277,6 +318,15 @@ export const deleteBoardinghouse = async (id: string): Promise<void> => {
   try {
     if (!id) throw new Error("Missing boardinghouse id");
     const bhRef = doc(db, COLLECTION_BOARDINGHOUSES, id);
+    const snapshotBeforeDelete = await getDoc(bhRef);
+    let storagePath: string | null = null;
+    if (snapshotBeforeDelete.exists()) {
+      const data = snapshotBeforeDelete.data() ?? {};
+      const ownerId = data.ownerId ? String(data.ownerId) : "";
+      if (ownerId) {
+        storagePath = `owners/${ownerId}/boardinghouses/${snapshotBeforeDelete.id}`;
+      }
+    }
     const roomsRef = collection(bhRef, SUBCOLLECTION_ROOMS);
 
     let snapshot = await getDocs(query(roomsRef, limitDocuments(500)));
@@ -289,6 +339,9 @@ export const deleteBoardinghouse = async (id: string): Promise<void> => {
     }
 
     await deleteDoc(bhRef);
+    if (storagePath) {
+      await deleteStorageTree(storagePath);
+    }
   } catch (error) {
     throw new Error(`deleteBoardinghouse failed: ${(error as Error).message}`);
   }

@@ -10,6 +10,11 @@ service firebase.storage {
       allow write: if isSignedIn() && request.auth.uid == ownerId;
     }
 
+    match /users/{userId}/avatar/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSignedIn() && request.auth.uid == userId;
+    }
+
     match /{allPaths=**} {
       allow read, write: if false;
     }

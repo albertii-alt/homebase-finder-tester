@@ -4,11 +4,12 @@ import { useIsMobile } from "../hooks/use-mobile";
 import { useToast } from "../hooks/use-toast";
 import { User, Trash2, Camera, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { onAuthStateChanged, deleteUser, signOut } from "firebase/auth";
+import { onAuthStateChanged, deleteUser } from "firebase/auth";
 import { auth, db, storage } from "@/firebase/config";
 import { doc, updateDoc, deleteDoc, collection, query, where, getDocs } from "firebase/firestore";
-import { ref, uploadString, getDownloadURL } from "firebase/storage";
+import { ref, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getUserDoc, deleteBoardinghouse } from "@/lib/firestore";
+import { CURRENT_USER_CHANGED_EVENT } from "@/lib/utils";
 import type { UserDoc } from "@/types/firestore";
 
 const DeleteAccountModal: React.FC<{
@@ -123,6 +124,65 @@ export default function AccountSettings(): JSX.Element {
 
   const [deleteModalOpen, setDeleteModalOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
+  const [uploadingAvatar, setUploadingAvatar] = React.useState(false);
+
+  const syncLocalCurrentUser = React.useCallback((updates: Partial<{ name: string; avatar: string }>) => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem("currentUser");
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return;
+      const next = { ...parsed, ...updates };
+      window.localStorage.setItem("currentUser", JSON.stringify(next));
+      window.dispatchEvent(new Event(CURRENT_USER_CHANGED_EVENT));
+    } catch {
+      // ignore local storage errors
+    }
+  }, []);
+
+  const deleteStorageBranch = React.useCallback(async (path: string) => {
+    if (!path) return;
+    try {
+      const rootRef = ref(storage, path);
+      const stack = [rootRef];
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (!current) continue;
+        const listing = await listAll(current);
+        if (listing.prefixes.length) {
+          stack.push(...listing.prefixes);
+        }
+        if (listing.items.length) {
+          await Promise.all(
+            listing.items.map((itemRef) =>
+              deleteObject(itemRef).catch((err) => {
+                const code = (err as { code?: string } | null)?.code;
+                if (code !== "storage/object-not-found") {
+                  console.warn("Failed to delete storage object", itemRef.fullPath, err);
+                }
+              })
+            )
+          );
+        }
+      }
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code;
+      if (code !== "storage/object-not-found") {
+        console.warn(`Storage cleanup skipped for ${path}`, err);
+      }
+    }
+  }, []);
+
+  const removeUserStorage = React.useCallback(
+    async (uid: string) => {
+      await Promise.all([
+        deleteStorageBranch(`users/${uid}/avatar`),
+        deleteStorageBranch(`owners/${uid}/boardinghouses`),
+      ]);
+    },
+    [deleteStorageBranch]
+  );
 
   React.useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
@@ -133,9 +193,10 @@ export default function AccountSettings(): JSX.Element {
             setUser(profile);
             setName(profile.fullName);
             setEmail(profile.email);
-            // Use a placeholder if no avatar (Firestore user doc doesn't have avatar field in types yet, but we can add it or use a separate storage path)
-            // For now, we'll use the dicebear one based on name
-            setAvatarUrl(`https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(profile.fullName)}`);
+            const fallbackAvatar = `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(profile.fullName)}`;
+            const resolvedAvatar = profile.avatarUrl ?? fallbackAvatar;
+            setAvatarUrl(resolvedAvatar);
+            syncLocalCurrentUser({ name: profile.fullName, avatar: resolvedAvatar });
           }
         } catch (err) {
           console.error("Failed to load user profile", err);
@@ -146,22 +207,25 @@ export default function AccountSettings(): JSX.Element {
       setLoading(false);
     });
     return () => unsubscribe();
-  }, [navigate]);
+  }, [navigate, syncLocalCurrentUser]);
 
   // Save handler: persist to Firestore
   const handleSave = async () => {
     if (!user) return;
-    
+    const trimmedName = name.trim();
+    const hasCustomAvatar = Boolean(user.avatarUrl);
+
     try {
       const userRef = doc(db, "users", user.uid);
       await updateDoc(userRef, {
-        fullName: name.trim(),
+        fullName: trimmedName,
       });
 
-      // Update local state
-      setUser({ ...user, fullName: name.trim() });
-      setAvatarUrl(`https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(name.trim())}`);
-
+      setUser((prev) => (prev ? { ...prev, fullName: trimmedName } : prev));
+      if (!hasCustomAvatar) {
+        setAvatarUrl(`https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(trimmedName)}`);
+      }
+      syncLocalCurrentUser({ name: trimmedName });
       toast({ title: "Saved", description: "Account details updated." });
     } catch (err) {
       console.error("Failed to save account settings", err);
@@ -171,16 +235,43 @@ export default function AccountSettings(): JSX.Element {
 
   const handleUploadAvatar = async (file?: File) => {
     if (!file || !user) return;
-    // For now, we just update the local preview as we don't have an avatar field in UserDoc yet
-    // In a real app, we would upload to Storage and update the user doc
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      if (e.target?.result) {
-        setAvatarUrl(e.target.result as string);
-      }
-    };
-    reader.readAsDataURL(file);
-    toast({ title: "Note", description: "Avatar upload is not fully implemented in backend yet." });
+    if (file.size > 5 * 1024 * 1024) {
+      toast({ title: "File too large", description: "Please choose an image under 5MB." });
+      return;
+    }
+
+    setUploadingAvatar(true);
+    try {
+      const fileExt = (() => {
+        const rawExt = file.name?.split(".").pop() ?? "";
+        const normalized = rawExt.toLowerCase().replace(/[^a-z0-9]/g, "");
+        return normalized || "jpg";
+      })();
+
+      const avatarRef = ref(
+        storage,
+        `users/${user.uid}/avatar/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${fileExt}`
+      );
+
+      await uploadBytes(avatarRef, file, {
+        contentType: file.type || "image/jpeg",
+      });
+
+      const downloadUrl = await getDownloadURL(avatarRef);
+      await updateDoc(doc(db, "users", user.uid), {
+        avatarUrl: downloadUrl,
+      });
+
+      setAvatarUrl(downloadUrl);
+      setUser((prev) => (prev ? { ...prev, avatarUrl: downloadUrl } : prev));
+      syncLocalCurrentUser({ avatar: downloadUrl });
+      toast({ title: "Avatar updated", description: "Your profile picture was saved." });
+    } catch (err) {
+      console.error("Failed to upload avatar", err);
+      toast({ title: "Upload failed", description: "Unable to update avatar. Please try again." });
+    } finally {
+      setUploadingAvatar(false);
+    }
   };
 
   const handleDeleteAccount = async () => {
@@ -195,13 +286,16 @@ export default function AccountSettings(): JSX.Element {
       const deletePromises = snapshot.docs.map(doc => deleteBoardinghouse(doc.id));
       await Promise.all(deletePromises);
 
-      // 2. Delete user document
+      // 2. Remove any files this user uploaded (avatars, boardinghouse photos, etc.)
+      await removeUserStorage(user.uid);
+
+      // 3. Delete user document
       await deleteDoc(doc(db, "users", user.uid));
 
-      // 3. Delete Firebase Auth user
+      // 4. Delete Firebase Auth user
       await deleteUser(auth.currentUser);
 
-      // 4. Clear local storage just in case
+      // 5. Clear local storage just in case
       localStorage.clear();
 
       toast({ title: "Account deleted", description: "Your account and listings have been removed." });
@@ -316,6 +410,7 @@ export default function AccountSettings(): JSX.Element {
                           type="file"
                           accept="image/*"
                           style={{ display: "none" }}
+                          disabled={uploadingAvatar}
                           onChange={(e) => {
                             const f = e.target.files?.[0];
                             if (f) handleUploadAvatar(f);
@@ -331,9 +426,11 @@ export default function AccountSettings(): JSX.Element {
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "center",
-                            cursor: "pointer",
+                            cursor: uploadingAvatar ? "not-allowed" : "pointer",
+                            opacity: uploadingAvatar ? 0.6 : 1,
                             boxShadow: "0 6px 14px rgba(37,99,235,0.18)",
                           }}
+                          title={uploadingAvatar ? "Uploading..." : "Change avatar"}
                         >
                           <Camera size={16} />
                         </div>

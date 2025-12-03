@@ -5,6 +5,7 @@ import { onAuthStateChanged, signOut as firebaseSignOut } from "firebase/auth";
 import LogoutModal from "@/components/LogoutModal"; // added import
 import { auth } from "@/firebase/config";
 import { getUserDoc } from "@/lib/firestore";
+import { CURRENT_USER_CHANGED_EVENT } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import type { UserRole } from "@/types/firestore";
 
@@ -114,6 +115,7 @@ export const Sidebar = () => {
           email: firebaseUser.email ?? profile.email ?? "",
           role: profile.role,
           avatar:
+            profile.avatarUrl ??
             firebaseUser.photoURL ??
             `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(
               profile.fullName || firebaseUser.email || "User"
@@ -141,11 +143,15 @@ export const Sidebar = () => {
     try {
       if (!profile) {
         localStorage.removeItem("currentUser");
-        return;
+      } else {
+        localStorage.setItem("currentUser", JSON.stringify(profile));
       }
-      localStorage.setItem("currentUser", JSON.stringify(profile));
     } catch {
       // ignore storage failures
+    } finally {
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event(CURRENT_USER_CHANGED_EVENT));
+      }
     }
   };
 
@@ -160,6 +166,43 @@ export const Sidebar = () => {
     navigate("/auth");
   };
   const handleLogoutClick = () => setShowLogoutModal(true);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const syncFromStoredProfile: EventListener = () => {
+      try {
+        const raw = window.localStorage.getItem("currentUser");
+        if (!raw) {
+          setUser(createGuestUser());
+          return;
+        }
+        const parsed = JSON.parse(raw) as Partial<CurrentUser> | null;
+        if (!parsed || !parsed.uid) {
+          setUser(createGuestUser());
+          return;
+        }
+        const fallbackAvatar = `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(
+          parsed.name ?? "Guest"
+        )}`;
+        setUser({
+          uid: String(parsed.uid),
+          name: parsed.name ?? "Guest",
+          email: parsed.email ?? "",
+          role: (parsed.role as UserRole | undefined) ?? "tenant",
+          avatar: parsed.avatar ?? fallbackAvatar,
+          loggedIn: Boolean(parsed.loggedIn),
+        });
+      } catch {
+        // ignore parsing errors and leave current sidebar state as-is
+      }
+    };
+
+    window.addEventListener(CURRENT_USER_CHANGED_EVENT, syncFromStoredProfile);
+    return () => window.removeEventListener(CURRENT_USER_CHANGED_EVENT, syncFromStoredProfile);
+  }, []);
 
   const menuItems = [
     { icon: Home, label: "Dashboard", path: "/dashboard" },
